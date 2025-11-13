@@ -381,6 +381,31 @@ Provide clear, structured output.""",
             }
         }
     
+    def _get_api_key(self, api_key_env: str, provider: LLMProvider) -> Optional[str]:
+        """
+        Get API key for a provider from provided api_keys dict or environment.
+        
+        Args:
+            api_key_env: Environment variable name for the API key
+            provider: LLM provider enum
+            
+        Returns:
+            API key string if found, None otherwise
+        """
+        # First check provided api_keys dictionary
+        provider_name = provider.value
+        if provider_name in self.api_keys:
+            api_key = self.api_keys[provider_name]
+            if api_key:
+                return api_key
+        
+        # Fallback to environment variable
+        api_key = os.getenv(api_key_env)
+        if api_key:
+            return api_key
+        
+        return None
+    
     def _validate_api_keys(self) -> None:
         """Validate available API keys and set default provider."""
         available_providers = []
@@ -474,7 +499,9 @@ Provide clear, structured output.""",
         """Check if API key is available for provider."""
         for config in self.models.values():
             if config.provider == provider and config.api_key_env:
-                return bool(os.getenv(config.api_key_env))
+                # Check both provided api_keys and environment
+                api_key = self._get_api_key(config.api_key_env, config.provider)
+                return bool(api_key)
         return False
     
     def get_system_prompt(self, document_type: str) -> str:
