@@ -72,5 +72,7 @@ tmp/
 *.temp
 *_temp.*
 
+output/
+
 # Documentation that contains sensitive info
 PROCESSING_RESULTS_SUMMARY.md

@@ -1,22 +1,25 @@
 """
 Hybrid Pipeline for Mechanical Drawing Parsing
 
-This module implements a three-stage hybrid pipeline architecture:
+This module implements a two-stage hybrid pipeline architecture with batch processing
+to prevent API rate limiting (429 errors):
 - Stage 1: Detection (Roboflow local server) - detects all potential annotations
-- Stage 2: Verification & Parsing (Gemini multimodal API) - verifies patches and parses values
-- Stage 3: Missing Items Scan (Gemini multimodal API) - finds annotations missed by Stage 1
+- Stage 2: Verification & Parsing (Gemini multimodal API) - verifies and parses all patches in a single batch API call
 
 Based on the research paper "Automated Parsing of Engineering Drawings..."
 """
 
 import asyncio
+import io
 import time
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
+from PIL import Image
 
 from od_parse.mechanical_drawing.gemini_client import (
     image_to_base64,
-    call_gemini_multimodal
+    call_gemini_multimodal,
+    stage2_run_batch_verification
 )
 from od_parse.mechanical_drawing.roboflow_client import call_roboflow_detection
 from od_parse.mechanical_drawing.image_utils import crop_image_patch
@@ -68,209 +71,29 @@ async def stage1_run_roboflow_detection(image_path: Path, roboflow_api_key: str)
         }
 
 
-async def stage2_run_gemini_verification(
-    image_path: Path,
-    patch_base64: str,
-    detection_class: str,
-    api_key: str
-) -> Optional[Dict[str, Any]]:
-    """
-    STAGE 2 (Gemini Verification & Parsing)
-    
-    Uses Gemini 2.5 Flash multimodal API to verify a patch and parse its content.
-    This acts as the "Donut" parser layer, verifying if detection is correct and
-    parsing the value from the patch.
-    
-    Args:
-        image_path: Path to the full image (for context, not used directly)
-        patch_base64: Base64-encoded image patch
-        detection_class: The class predicted by Roboflow (e.g., "dimension", "radius")
-        api_key: Google API key for Gemini
-    
-    Returns:
-        Structured JSON object if verification succeeds, None if false positive
-    """
-    logger.debug(f"Stage 2: Verifying patch for class: \"{detection_class}\"")
-    
-    try:
-        # Add rate limiting delay to avoid hitting API limits
-        await asyncio.sleep(0.05)
-        
-        # System prompt for verification and parsing
-        system_prompt = f"""You are an expert mechanical drawing verifier and parser.
-Another AI model has provided this image patch and believes it contains a: "{detection_class}".
-
-Your tasks are:
-1. **VERIFY:** Is this correct? Does this patch *actually* contain a "{detection_class}"?
-2. **PARSE:** If yes, parse the annotation into a structured JSON object.
-
-Use the following schemas:
-- For "dimension": {{"type": "LinearDimension", "value": 10}}
-- For "radius": {{"type": "Radius", "value": 10, "count": 1}}
-- For "gdt": {{"type": "GD_T", "symbol": "...", "value": 0.1, "datums": ["A", "B"]}}
-- For "view": {{"type": "ViewLabel", "name": "Detail View A"}}
-
-**CRITICAL:** If this is a false positive, or you cannot read the value,
-or the patch does not contain the expected object, you MUST return **null**."""
-        
-        # Define response schema with oneOf to allow null or structured object
-        response_schema = {
-            "oneOf": [
-                {"type": "NULL"},
-                {
-                    "type": "OBJECT",
-                    "properties": {
-                        "type": {"type": "STRING"},
-                        "value": {"type": "NUMBER"},
-                        "count": {"type": "NUMBER"},
-                        "name": {"type": "STRING"},
-                        "symbol": {"type": "STRING"},
-                        "datums": {"type": "ARRAY", "items": {"type": "STRING"}}
-                    },
-                    "required": ["type"]
-                }
-            ]
-        }
-        
-        # Call Gemini multimodal API with patch
-        result = await asyncio.to_thread(
-            call_gemini_multimodal,
-            api_key,
-            patch_base64,
-            "Verify and parse this patch.",
-            response_schema,
-            "image/png"  # Patches are saved as PNG
-        )
-        
-        # If result is null or None, return None (false positive)
-        if result is None:
-            return None
-        
-        # Check if result is a dict with type field (valid parsing)
-        if isinstance(result, dict) and result.get('type'):
-            return result
-        
-        # Otherwise, treat as false positive
-        return None
-        
-    except Exception as e:
-        logger.error(f"Error in Stage 2 (Verification \"{detection_class}\"): {e}")
-        return None  # Treat errors as false positives
-
-
-async def stage3_find_missing_annotations(
-    image_path: Path,
-    verified_annotations: Dict[str, Any],
-    api_key: str
-) -> List[Dict[str, Any]]:
-    """
-    STAGE 3 (Gemini Missing Annotations Scan)
-    
-    Scans the full image and compares against the list of found items
-    to find any annotations that were missed by Stage 1.
-    
-    Args:
-        image_path: Path to the full mechanical drawing image
-        verified_annotations: The final JSON object from Stage 2 (verified annotations)
-        api_key: Google API key for Gemini
-    
-    Returns:
-        List of newly found structured JSON annotations
-    """
-    logger.info("Stage 3: Running final 'missing values' scan...")
-    
-    try:
-        # Convert full image to base64
-        base64_image = await asyncio.to_thread(image_to_base64, image_path)
-        
-        # Determine MIME type from file extension
-        mime_type = "image/png"
-        if image_path.suffix.lower() in ['.jpg', '.jpeg']:
-            mime_type = "image/jpeg"
-        
-        # Convert verified annotations to JSON string
-        import json
-        annotations_json_string = json.dumps(verified_annotations, indent=2)
-        
-        # System prompt for missing items scan
-        system_prompt = """You are a Quality Assurance inspector for a drawing parser.
-A primary system has already scanned the attached image and found
-the annotations in the following JSON block.
-
-**YOUR TASK:**
-Carefully scan the **entire image** and find any text-based annotations
-(dimensions, radii, view labels, GD&T) that are **MISSING** from the JSON.
-
-- Do NOT return items that are already in the JSON.
-- For each *new* item you find, parse it using the same schemas as before
-  (e.g., {"type": "LinearDimension", "value": 10}).
-- If you find no missing items, return an empty array []."""
-        
-        # Define response schema
-        response_schema = {
-            "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "properties": {
-                    "type": {"type": "STRING"},
-                    "value": {"type": "NUMBER"},
-                    "count": {"type": "NUMBER"},
-                    "name": {"type": "STRING"},
-                    "symbol": {"type": "STRING"},
-                    "datums": {"type": "ARRAY", "items": {"type": "STRING"}}
-                },
-                "required": ["type"]
-            }
-        }
-        
-        # Construct prompt with annotations list
-        prompt = f"Here are the annotations we found so far:\n{annotations_json_string}\n\nNow, please find any that are missing from the image."
-        
-        # Call Gemini multimodal API
-        missing_items = await asyncio.to_thread(
-            call_gemini_multimodal,
-            api_key,
-            base64_image,
-            prompt,
-            response_schema,
-            mime_type
-        )
-        
-        # Ensure we have a list
-        if not isinstance(missing_items, list):
-            logger.warning(f"Expected list from API, got {type(missing_items)}. Wrapping in list.")
-            missing_items = [missing_items] if missing_items else []
-        
-        logger.info(f"Stage 3: Found {len(missing_items)} missing annotations.")
-        return missing_items
-        
-    except Exception as e:
-        logger.error(f"Error in Stage 3 (Missing Values Scan): {e}")
-        return []  # Return empty array on failure
-
-
 async def run_full_hybrid_pipeline(
     image_path: Path,
     roboflow_api_key: str,
-    gemini_api_key: str
+    gemini_api_key: str,
+    page_number: int = 1
 ) -> Dict[str, Any]:
     """
-    MAIN HYBRID PARSING PIPELINE
+    MAIN HYBRID PARSING PIPELINE (Batch Processing - Rate-Limit Safe)
     
-    Orchestrates the complete three-stage hybrid pipeline:
-    1. Stage 1: Roboflow detection (local server)
-    2. Stage 2: Gemini verification & parsing (parallel patch processing)
-    3. Stage 3: Gemini missing items scan (full image QA)
+    Orchestrates a two-stage hybrid pipeline with batch processing to prevent 429 errors:
+    1. Stage 1: Roboflow detection (local server) - detects all potential annotations
+    2. Stage 2: Gemini verification & parsing (batch processing) - verifies and parses all patches in a single API call
     
     Args:
         image_path: Path to the mechanical drawing image
         roboflow_api_key: Roboflow API key
         gemini_api_key: Google API key for Gemini
+        page_number: The page number this image corresponds to (for labeling, default: 1)
     
     Returns:
         Final structured JSON dictionary organized by category
     """
-    logger.info("Starting full HYBRID parsing pipeline...")
+    logger.info(f"Starting 2-Stage HYBRID pipeline (Page {page_number}, BATCHED, Rate-Limit Safe)...")
     start_time = time.time()
     
     try:
@@ -281,41 +104,112 @@ async def run_full_hybrid_pipeline(
         roboflow_result = await stage1_run_roboflow_detection(image_path, roboflow_api_key)
         
         predictions = roboflow_result.get('predictions', [])
+        original_width = roboflow_result.get('originalWidth', 0)
+        original_height = roboflow_result.get('originalHeight', 0)
         
         if not predictions or len(predictions) == 0:
-            logger.warning("Stage 1 failed to find any annotations. Proceeding to Stage 3 as fallback.")
+            logger.warning("Stage 1 failed to find any annotations.")
+            return {
+                'Measures': [],
+                'Radii': [],
+                'Views': [],
+                'GD_T': [],
+                'Materials': [],
+                'Notes': [],
+                'Threads': [],
+                'SurfaceRoughness': [],
+                'GeneralTolerances': [],
+                'TitleBlock': [],
+                'Other': [],
+                '_Errors': [],
+                '_FalsePositives': [],
+                'metadata': {
+                    'processing_time': time.time() - start_time,
+                    'annotations_detected': 0,
+                    'annotations_verified': 0,
+                    'pipeline_stages': 2,
+                    'stage1_detections': 0,
+                    'stage2_verified': 0,
+                    'page_number': page_number
+                }
+            }
         
-        # --- STAGE 2: GEMINI VERIFICATION & PARSING (in parallel) ---
+        # --- PREPARE PATCHES FOR BATCHING ---
         logger.info("=" * 60)
-        logger.info(f"STAGE 2: Verification & Parsing (Gemini) - Processing {len(predictions)} patches in parallel")
+        logger.info(f"STAGE 2: Preparing {len(predictions)} patches for batch processing...")
         logger.info("=" * 60)
         
-        verification_tasks = []
-        for pred in predictions:
-            # Crop the patch from the original image
-            patch_base64 = await asyncio.to_thread(
-                crop_image_patch,
-                image_path,
-                pred['x'],
-                pred['y'],
-                pred['width'],
-                pred['height']
-            )
+        patches_to_process: List[Tuple[bytes, str]] = []
+        
+        # Load image once for all crops
+        with Image.open(image_path) as img:
+            # Ensure we're working with RGB mode
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
             
-            # Create verification task
-            verification_tasks.append(
-                stage2_run_gemini_verification(
-                    image_path,
-                    patch_base64,
-                    pred['class'],
-                    gemini_api_key
-                )
-            )
+            for pred in predictions:
+                try:
+                    # Add margin to crop for better context
+                    margin = 10  # 10px margin
+                    crop_x = max(0, pred['x'] - margin)
+                    crop_y = max(0, pred['y'] - margin)
+                    crop_w = min(original_width - crop_x, pred['width'] + (margin * 2))
+                    crop_h = min(original_height - crop_y, pred['height'] + (margin * 2))
+                    
+                    # Crop box is (left, upper, right, lower)
+                    box = (crop_x, crop_y, crop_x + crop_w, crop_y + crop_h)
+                    patch_img = img.crop(box)
+                    
+                    # Convert PIL Image to bytes
+                    with io.BytesIO() as output:
+                        patch_img.save(output, format="PNG")
+                        patch_bytes = output.getvalue()
+                    
+                    patches_to_process.append((patch_bytes, pred['class']))
+                    
+                except Exception as crop_error:
+                    logger.error(f"Error cropping patch for class {pred.get('class', 'unknown')}: {crop_error}")
+                    # Add empty bytes as placeholder - batch function will handle it
+                    patches_to_process.append((b'', pred.get('class', 'unknown')))
         
-        # Process all patches in parallel
-        verified_results = await asyncio.gather(*verification_tasks)
+        # --- STAGE 2: GEMINI BATCH VERIFICATION & PARSING (ONE CALL) ---
+        logger.info("=" * 60)
+        logger.info(f"STAGE 2: Verification & Parsing (Gemini) - Processing {len(patches_to_process)} patches in ONE batch")
+        logger.info("=" * 60)
         
-        # --- AGGREGATION (PRE-SCAN) ---
+        # Make single batch API call
+        verified_results = await asyncio.to_thread(
+            stage2_run_batch_verification,
+            patches_to_process,
+            gemini_api_key
+        )
+        
+        if not verified_results:
+            logger.error("Stage 2 (Gemini Batch) returned no results.")
+            verified_results = []
+        
+        # Ensure we have the same number of results as predictions
+        if len(verified_results) != len(predictions):
+            logger.warning(f"Batch result count mismatch: {len(verified_results)} results for {len(predictions)} predictions")
+            # Pad with None if needed
+            while len(verified_results) < len(predictions):
+                verified_results.append(None)
+            # Truncate if too many
+            verified_results = verified_results[:len(predictions)]
+        
+        # Add source prediction info to each result
+        for i, result in enumerate(verified_results):
+            if result is not None and isinstance(result, dict):
+                result['_source'] = predictions[i] if i < len(predictions) else {}
+            elif result is None:
+                # False positive - create placeholder
+                verified_results[i] = {
+                    'type': None,
+                    '_source': predictions[i] if i < len(predictions) else {},
+                    '_false_positive': True
+                }
+        
+        # --- AGGREGATION ---
         logger.info("Aggregating verified results by category...")
         
         final_json = {
@@ -329,20 +223,34 @@ async def run_full_hybrid_pipeline(
             'SurfaceRoughness': [],
             'GeneralTolerances': [],
             'TitleBlock': [],
-            'Other': []
+            'Other': [],
+            '_Errors': [],
+            '_FalsePositives': []
         }
         
-        # Filter out None values (false positives) and categorize
-        for i, result in enumerate(verified_results):
+        # Categorize results
+        for result in verified_results:
+            # Handle false positives and errors
+            if result.get('_false_positive'):
+                final_json['_FalsePositives'].append(result)
+                continue
+            
+            if result.get('type') == 'Error':
+                final_json['_Errors'].append(result)
+                continue
+            
+            # Skip None or invalid results
             if result is None or not result.get('type'):
-                continue  # Skip false positives
+                final_json['_FalsePositives'].append(result)
+                continue
             
             result_type = result.get('type', '')
             
-            # Add source info for tracking
-            clean_result = {k: v for k, v in result.items() if k != '_source'}
-            clean_result['_source'] = predictions[i] if i < len(predictions) else {}
+            # Add source info for tracking (remove internal fields)
+            clean_result = {k: v for k, v in result.items() if k not in ['_source', '_false_positive', 'error']}
+            clean_result['_source'] = result.get('_source', {})
             
+            # Categorize by type
             if result_type == 'LinearDimension':
                 final_json['Measures'].append(clean_result)
             elif result_type == 'Radius':
@@ -366,61 +274,28 @@ async def run_full_hybrid_pipeline(
             else:
                 final_json['Other'].append(clean_result)
         
-        logger.info(f"Stage 2 complete. Verified {sum(len(v) for v in final_json.values())} annotations.")
-        
-        # --- STAGE 3: GEMINI "MISSING VALUES" SCAN ---
-        logger.info("=" * 60)
-        logger.info("STAGE 3: Missing Annotations Scan (Gemini)")
-        logger.info("=" * 60)
-        missing_items = await stage3_find_missing_annotations(image_path, final_json, gemini_api_key)
-        
-        # --- FINAL AGGREGATION ---
-        # Add the newly found missing items to our final JSON
-        for item in missing_items:
-            item_type = item.get('type', '')
-            
-            if item_type == 'LinearDimension':
-                final_json['Measures'].append(item)
-            elif item_type == 'Radius':
-                final_json['Radii'].append(item)
-            elif item_type in ['ViewLabel', 'ViewCallout']:
-                final_json['Views'].append(item)
-            elif item_type == 'GD_T':
-                final_json['GD_T'].append(item)
-            elif item_type == 'Material':
-                final_json['Materials'].append(item)
-            elif item_type == 'Note':
-                final_json['Notes'].append(item)
-            elif item_type == 'Thread':
-                final_json['Threads'].append(item)
-            elif item_type == 'SurfaceRoughness':
-                final_json['SurfaceRoughness'].append(item)
-            elif item_type == 'GeneralTolerance':
-                final_json['GeneralTolerances'].append(item)
-            elif item_type == 'TitleBlock':
-                final_json['TitleBlock'].append(item)
-            else:
-                final_json['Other'].append(item)
-        
         # Add metadata
         processing_time = time.time() - start_time
+        verified_count = sum(1 for r in verified_results if r is not None and r.get('type') and not r.get('_false_positive') and r.get('type') != 'Error')
         final_json['metadata'] = {
             'processing_time': processing_time,
             'annotations_detected': len(predictions),
-            'annotations_verified': sum(len(v) for v in final_json.values()) - len(missing_items),
-            'annotations_missing_found': len(missing_items),
-            'pipeline_stages': 3,
+            'annotations_verified': verified_count,
+            'pipeline_stages': 2,
             'stage1_detections': len(predictions),
-            'stage2_verified': sum(1 for r in verified_results if r is not None),
-            'stage3_missing_found': len(missing_items)
+            'stage2_verified': verified_count,
+            'stage2_false_positives': len(final_json['_FalsePositives']),
+            'stage2_errors': len(final_json['_Errors']),
+            'page_number': page_number
         }
         
         logger.info("=" * 60)
         logger.info("Pipeline complete!")
         logger.info(f"Processing time: {processing_time:.3f}s")
         logger.info(f"Detected: {len(predictions)} annotations")
-        logger.info(f"Verified: {sum(1 for r in verified_results if r is not None)} annotations")
-        logger.info(f"Missing found: {len(missing_items)} annotations")
+        logger.info(f"Verified: {verified_count} annotations")
+        logger.info(f"False positives: {len(final_json['_FalsePositives'])}")
+        logger.info(f"Errors: {len(final_json['_Errors'])}")
         logger.info("=" * 60)
         
         return final_json
@@ -440,9 +315,12 @@ async def run_full_hybrid_pipeline(
             'GeneralTolerances': [],
             'TitleBlock': [],
             'Other': [],
+            '_Errors': [],
+            '_FalsePositives': [],
             'metadata': {
                 'processing_time': time.time() - start_time,
-                'error': str(e)
+                'error': str(e),
+                'page_number': page_number
             }
         }
 
@@ -450,7 +328,8 @@ async def run_full_hybrid_pipeline(
 def run_full_hybrid_pipeline_sync(
     image_path: Path,
     roboflow_api_key: str,
-    gemini_api_key: str
+    gemini_api_key: str,
+    page_number: int = 1
 ) -> Dict[str, Any]:
     """
     Synchronous wrapper for run_full_hybrid_pipeline.
@@ -461,11 +340,12 @@ def run_full_hybrid_pipeline_sync(
         image_path: Path to the mechanical drawing image
         roboflow_api_key: Roboflow API key
         gemini_api_key: Google API key for Gemini
+        page_number: The page number this image corresponds to (for labeling, default: 1)
     
     Returns:
         Final structured JSON dictionary organized by category
     """
-    return asyncio.run(run_full_hybrid_pipeline(image_path, roboflow_api_key, gemini_api_key))
+    return asyncio.run(run_full_hybrid_pipeline(image_path, roboflow_api_key, gemini_api_key, page_number))
 
 
 async def run_full_parsing_pipeline(image_path: Path, api_key: str) -> Dict[str, Any]:
