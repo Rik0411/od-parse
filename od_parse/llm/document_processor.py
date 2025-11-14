@@ -8,6 +8,7 @@ for complex PDF understanding and structured data extraction.
 import os
 import json
 import base64
+import time
 from typing import Dict, Any, Optional, List, Union
 from pathlib import Path
 from PIL import Image
@@ -357,22 +358,55 @@ class LLMDocumentProcessor:
             if document_images and model_config.supports_vision:
                 content.extend(document_images[:3])  # Add first 3 pages
             
-            # Make API call
-            response = model.generate_content(
-                content,
-                generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=model_config.max_tokens,
-                    temperature=model_config.temperature,
-                )
-            )
+            # Make API call with retry logic for 429 errors
+            max_retries = 3
+            response = None
+            for attempt in range(max_retries):
+                try:
+                    response = model.generate_content(
+                        content,
+                        generation_config=genai.types.GenerationConfig(
+                            max_output_tokens=model_config.max_tokens,
+                            temperature=model_config.temperature,
+                        )
+                    )
+                    break  # Success, exit retry loop
+                except Exception as api_error:
+                    error_msg = str(api_error).lower()
+                    # Check if this is a 429 rate limit error
+                    is_429_error = "429" in error_msg or "resource exhausted" in error_msg
+                    
+                    if is_429_error and attempt < max_retries - 1:
+                        # Calculate exponential backoff delay: 1s, 2s, 4s
+                        delay = 2 ** attempt
+                        self.logger.warning(f"429 rate limit error (attempt {attempt + 1}/{max_retries}), retrying in {delay}s...")
+                        time.sleep(delay)
+                    else:
+                        # Not a 429 error, or max retries reached - re-raise
+                        raise
             
             # Parse response
             response_text = response.text
+            
+            # Try to extract JSON from response
             try:
+                # First, try to parse the entire response as JSON
                 result = json.loads(response_text)
             except json.JSONDecodeError:
-                # If not valid JSON, wrap in structure
-                result = {"extracted_text": response_text}
+                # If that fails, try to find JSON within the response
+                # (LLM might return explanations with JSON embedded)
+                try:
+                    json_start = response_text.find('{')
+                    json_end = response_text.rfind('}')
+                    if json_start >= 0 and json_end >= 0 and json_end > json_start:
+                        json_str = response_text[json_start:json_end+1]
+                        result = json.loads(json_str)
+                    else:
+                        # No JSON found, wrap entire response
+                        result = {"extracted_text": response_text}
+                except json.JSONDecodeError:
+                    # JSON extraction failed, wrap entire response
+                    result = {"extracted_text": response_text}
             
             return {
                 "extracted_data": result,
