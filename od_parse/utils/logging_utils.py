@@ -22,8 +22,14 @@ def get_logger(name: str, level: Optional[int] = None) -> logging.Logger:
     
     logger = logging.getLogger(name)
     
+    # Check if root logger already has handlers configured
+    # If root logger is configured, child loggers should inherit from it
+    # to avoid duplicate log messages
+    root_has_handlers = len(logging.root.handlers) > 0
+    
     # Only configure the logger if it hasn't been configured yet
-    if not logger.handlers:
+    # AND root logger is not already configured
+    if not logger.handlers and not root_has_handlers:
         logger.setLevel(level)
         
         # Create console handler
@@ -38,6 +44,10 @@ def get_logger(name: str, level: Optional[int] = None) -> logging.Logger:
         
         # Add handler to logger
         logger.addHandler(handler)
+    elif root_has_handlers:
+        # Root logger is already configured, just set the level
+        # Child logger will inherit the root logger's handler
+        logger.setLevel(level)
     
     return logger
 
