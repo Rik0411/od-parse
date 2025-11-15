@@ -1,16 +1,18 @@
 """
 Hybrid Pipeline for Mechanical Drawing Parsing
 
-This module implements a two-stage hybrid pipeline architecture with batch processing
+This module implements a three-stage hybrid pipeline architecture with batch processing
 to prevent API rate limiting (429 errors):
 - Stage 1: Detection (Roboflow local server) - detects all potential annotations
 - Stage 2: Verification & Parsing (Gemini multimodal API) - verifies and parses all patches in a single batch API call
+- Stage 3: Missing Item Scan (Gemini multimodal API) - safety net that scans full image to find annotations Roboflow missed
 
 Based on the research paper "Automated Parsing of Engineering Drawings..."
 """
 
 import asyncio
 import io
+import os
 import time
 from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
@@ -80,9 +82,10 @@ async def run_full_hybrid_pipeline(
     """
     MAIN HYBRID PARSING PIPELINE (Batch Processing - Rate-Limit Safe)
     
-    Orchestrates a two-stage hybrid pipeline with batch processing to prevent 429 errors:
+    Orchestrates a three-stage hybrid pipeline with batch processing to prevent 429 errors:
     1. Stage 1: Roboflow detection (local server) - detects all potential annotations
     2. Stage 2: Gemini verification & parsing (batch processing) - verifies and parses all patches in a single API call
+    3. Stage 3: Gemini missing item scan (safety net) - scans full image to find annotations Roboflow missed
     
     Args:
         image_path: Path to the mechanical drawing image
@@ -93,7 +96,7 @@ async def run_full_hybrid_pipeline(
     Returns:
         Final structured JSON dictionary organized by category
     """
-    logger.info(f"Starting 2-Stage HYBRID pipeline (Page {page_number}, BATCHED, Rate-Limit Safe)...")
+    logger.info(f"Starting 3-Stage HYBRID pipeline (Page {page_number}, BATCHED, Rate-Limit Safe)...")
     start_time = time.time()
     
     try:
@@ -127,9 +130,10 @@ async def run_full_hybrid_pipeline(
                     'processing_time': time.time() - start_time,
                     'annotations_detected': 0,
                     'annotations_verified': 0,
-                    'pipeline_stages': 2,
+                    'pipeline_stages': 3,
                     'stage1_detections': 0,
                     'stage2_verified': 0,
+                    'stage3_missing_found': 0,
                     'page_number': page_number
                 }
             }
@@ -274,6 +278,100 @@ async def run_full_hybrid_pipeline(
             else:
                 final_json['Other'].append(clean_result)
         
+        # --- STAGE 3: MISSING ITEM SCAN (Safety Net) ---
+        logger.info("=" * 60)
+        logger.info("STAGE 3: Missing Item Scan (Safety Net)")
+        logger.info("=" * 60)
+        
+        missing_items = []
+        try:
+            # Collect all found annotations (non-false-positive) for comparison
+            found_annotations = []
+            for category in ['Measures', 'Radii', 'Views', 'GD_T', 'Materials', 
+                           'Notes', 'Threads', 'SurfaceRoughness', 'GeneralTolerances', 
+                           'TitleBlock', 'Other']:
+                found_annotations.extend(final_json[category])
+            
+            # Load full image as bytes
+            with Image.open(image_path) as img:
+                # Ensure we're working with RGB mode
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                # Convert PIL Image to bytes
+                with io.BytesIO() as buffer:
+                    img.save(buffer, format="PNG")
+                    page_image_bytes = buffer.getvalue()
+            
+            # Call Stage 3 missing item scan
+            from od_parse.mechanical_drawing.gemini_client import stage3_runMissingItemScan
+            
+            missing_items = await asyncio.to_thread(
+                stage3_runMissingItemScan,
+                page_image_bytes,
+                found_annotations,
+                page_number,
+                gemini_api_key
+            )
+            
+            if missing_items:
+                logger.info(f"Stage 3: Found {len(missing_items)} missing annotations, merging into results...")
+                
+                # Merge missing items into final_json using same categorization logic
+                for item in missing_items:
+                    if not item or not isinstance(item, dict):
+                        continue
+                    
+                    item_type = item.get("type", "").lower()
+                    item_id = item.get("id", f"miss_{len(missing_items)}")
+                    
+                    # Mark as from Stage 3
+                    clean_item = {k: v for k, v in item.items() if k != '_source'}
+                    clean_item['_source'] = {'stage': 3}
+                    
+                    # Categorize by type (matching Stage 2 logic)
+                    if item_type in ["linear", "angular", "diameter"]:
+                        # Map to LinearDimension format
+                        final_json['Measures'].append({
+                            'id': item_id,
+                            'type': 'LinearDimension',
+                            'value': item.get("value"),
+                            'units': item.get("units", "mm"),
+                            'text': item.get("text", ""),
+                            '_source': {'stage': 3}
+                        })
+                    elif item_type == "radial":
+                        final_json['Radii'].append({
+                            'id': item_id,
+                            'type': 'Radius',
+                            'value': item.get("value"),
+                            'text': item.get("text", ""),
+                            '_source': {'stage': 3}
+                        })
+                    elif "view" in item_type or item.get("content"):
+                        final_json['Views'].append({
+                            'id': item_id,
+                            'type': 'ViewLabel',
+                            'name': item.get("content", item.get("text", "")),
+                            'text': item.get("text", ""),
+                            '_source': {'stage': 3}
+                        })
+                    else:
+                        final_json['Other'].append({
+                            **clean_item,
+                            '_source': {'stage': 3}
+                        })
+            else:
+                logger.info("Stage 3: No missing annotations found.")
+                
+        except Exception as stage3_error:
+            logger.warning(f"Stage 3 (Missing Item Scan) failed: {stage3_error}. Continuing with Stage 1/2 results...")
+            # Don't fail the entire pipeline if Stage 3 fails
+            final_json['_Errors'].append({
+                'stage': 3,
+                'error': str(stage3_error)
+            })
+        
         # Add metadata
         processing_time = time.time() - start_time
         verified_count = sum(1 for r in verified_results if r is not None and r.get('type') and not r.get('_false_positive') and r.get('type') != 'Error')
@@ -281,11 +379,12 @@ async def run_full_hybrid_pipeline(
             'processing_time': processing_time,
             'annotations_detected': len(predictions),
             'annotations_verified': verified_count,
-            'pipeline_stages': 2,
+            'pipeline_stages': 3,
             'stage1_detections': len(predictions),
             'stage2_verified': verified_count,
             'stage2_false_positives': len(final_json['_FalsePositives']),
             'stage2_errors': len(final_json['_Errors']),
+            'stage3_missing_found': len(missing_items),
             'page_number': page_number
         }
         
@@ -294,6 +393,7 @@ async def run_full_hybrid_pipeline(
         logger.info(f"Processing time: {processing_time:.3f}s")
         logger.info(f"Detected: {len(predictions)} annotations")
         logger.info(f"Verified: {verified_count} annotations")
+        logger.info(f"Missing items found: {len(missing_items)}")
         logger.info(f"False positives: {len(final_json['_FalsePositives'])}")
         logger.info(f"Errors: {len(final_json['_Errors'])}")
         logger.info("=" * 60)
@@ -501,17 +601,15 @@ def run_full_parsing_pipeline_sync(
     
     Args:
         image_path: Path to the mechanical drawing image
-        roboflow_api_key: Roboflow API key (defaults to ub3sg9EEXSEZhVGZL4JD if None)
+        roboflow_api_key: Roboflow API key (defaults to ROBOFLOW_API_KEY environment variable if None)
         gemini_api_key: Google API key for Gemini (required)
     
     Returns:
         Final structured JSON dictionary organized by category
     """
-    from od_parse.mechanical_drawing.roboflow_client import DEFAULT_API_KEY
-    
-    # Use default Roboflow API key if not provided
+    # Use Roboflow API key from parameter or environment variable
     if roboflow_api_key is None:
-        roboflow_api_key = DEFAULT_API_KEY
+        roboflow_api_key = os.getenv("ROBOFLOW_API_KEY")
     
     if gemini_api_key is None:
         raise ValueError("gemini_api_key is required")

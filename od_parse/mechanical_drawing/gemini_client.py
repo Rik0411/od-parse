@@ -595,3 +595,317 @@ Return your analysis as a structured JSON object with the following structure:
     logger.error("Rate limit exceeded after all retries on image batch call.")
     return {}
 
+
+def stage2_runBatchTextParsing(
+    text_items: List[str],
+    page_number: int,
+    api_key: str
+) -> List[Dict[str, Any]]:
+    """
+    STAGE 2 (Gemini Batch Text-Only Parsing)
+    
+    Parses a LIST of TEXT strings from a vector PDF.
+    This is much faster and cheaper than multimodal.
+    
+    Args:
+        text_items: A list of text strings extracted by PyMuPDF
+        page_number: The page number for logging
+        api_key: Google API key for Gemini
+    
+    Returns:
+        A list of structured JSON objects, or []
+    """
+    logger.info(f"Stage 2 (Vector): Batch processing {len(text_items)} text strings for page {page_number}...")
+    
+    if not text_items:
+        logger.warning("No text items provided for batch text parsing")
+        return []
+    
+    # Use 2.5-flash for better large context handling
+    url = f"{GEMINI_API_BASE}/models/{GEMINI_MODEL_BATCH}:generateContent"
+    
+    # Join all text items with a clear separator
+    prompt_text = "\n---\n".join(text_items)
+    
+    system_prompt = """You are an expert mechanical drawing parser.
+I have extracted the following text fragments from a vector PDF.
+Please parse EVERY fragment that looks like a dimension, radius, or view label.
+Ignore all other text.
+
+**YOUR TASKS:**
+1. Read all the text fragments provided between the "---" separators.
+2. Parse *only* the drawing annotations into structured JSON using the schemas below.
+3. **RETURN:** You MUST return a single JSON array containing *only* the
+   parsed annotations. Do NOT return null entries or entries for ignored text.
+
+**SCHEMAS:**
+{
+  "id": "d1",
+  "type": "linear" | "radial" | "diameter" | "angular",
+  "value": 10.5,
+  "units": "mm", // Infer 'mm' if not specified
+  "text": "R10" // The raw text fragment
+}
+{
+  "id": "t1",
+  "content": "Detail View A",
+  "layer": "TEXT",
+  "style": "Standard"
+}
+
+**CRITICAL:** Your output MUST be a JSON array of parsed objects only."""
+    
+    # Define the response schema
+    response_schema = {
+        "type": "ARRAY",
+        "items": {
+            "type": "OBJECT",
+            "properties": {
+                "id": {"type": "STRING"},
+                "type": {"type": "STRING"},
+                "value": {"type": "NUMBER"},
+                "units": {"type": "STRING"},
+                "text": {"type": "STRING"},
+                "content": {"type": "STRING"},
+                "layer": {"type": "STRING"},
+                "style": {"type": "STRING"}
+            },
+            "required": ["id"]
+        }
+    }
+    
+    payload = {
+        "contents": [
+            {"role": "user", "parts": [{"text": prompt_text}]}
+        ],
+        "systemInstruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": response_schema
+        }
+    }
+    
+    # Implement retry logic
+    params = {"key": api_key}
+    headers = {"Content-Type": "application/json"}
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(url, json=payload, params=params, headers=headers, timeout=120)
+            
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < MAX_RETRIES - 1:
+                    wait = (attempt + 1) * 2
+                    logger.warning(f"API Error ({response.status_code}) on BATCH TEXT call. Retrying in {wait}s (attempt {attempt+1}/{MAX_RETRIES})...")
+                    time.sleep(wait)
+                    continue
+                else:
+                    logger.error(f"API Error ({response.status_code}) exceeded retries on BATCH TEXT call")
+                    response.raise_for_status()
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            if not result.get('candidates'):
+                logger.error(f"Batch text parse FAILED: No candidates in response. Response: {result}")
+                return []
+            
+            json_text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '[]')
+            parsed_list = json.loads(json_text)
+            
+            if not isinstance(parsed_list, list):
+                logger.error(f"Batch text parse FAILED: Expected array, got {type(parsed_list)}")
+                return []
+            
+            logger.info(f"Stage 2 (Vector): Batch processing complete. Parsed {len(parsed_list)} items from {len(text_items)} strings.")
+            return parsed_list
+            
+        except requests.exceptions.HTTPError as e:
+            if (e.response.status_code == 429 or e.response.status_code >= 500) and attempt < MAX_RETRIES - 1:
+                continue
+            logger.error(f"API request failed with HTTP error: {e}", exc_info=True)
+            return []
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed with non-retriable error: {e}", exc_info=True)
+            return []
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing batch text response: {e}", exc_info=True)
+            return []
+        except Exception as e:
+            logger.error(f"Error parsing batch text response: {e}", exc_info=True)
+            return []
+    
+    logger.error("Rate limit exceeded after all retries on BATCH TEXT call.")
+    return []
+
+
+def stage3_runMissingItemScan(
+    page_image_bytes: bytes,
+    found_annotations: List[Dict[str, Any]],
+    page_number: int,
+    api_key: str
+) -> List[Dict[str, Any]]:
+    """
+    STAGE 3 (Gemini "Missing Item" Safety Net)
+    
+    Scans the full image and compares against the list of found items
+    to find any annotations that Roboflow (Stage 1) missed.
+    
+    Args:
+        page_image_bytes: The full PNG image of the page as bytes
+        found_annotations: The list of dicts for annotations already found in Stage 2
+        page_number: The page number for logging
+        api_key: Google API key for Gemini
+    
+    Returns:
+        A list of *newly found* structured JSON annotations
+    """
+    logger.info(f"Stage 3: Running 'Missing Item' scan on page {page_number}...")
+    
+    if not found_annotations:
+        found_annotations_json = "[]"
+    else:
+        # We only need the 'text' or 'content' for the check, not the whole object
+        simple_list = []
+        for item in found_annotations:
+            if isinstance(item, dict):
+                if "text" in item:
+                    simple_list.append(item["text"])
+                elif "content" in item:
+                    simple_list.append(item["content"])
+        found_annotations_json = json.dumps(simple_list)
+    
+    # Use 2.5-flash for better large context handling
+    url = f"{GEMINI_API_BASE}/models/{GEMINI_MODEL_BATCH}:generateContent"
+    
+    page_base64 = base64.b64encode(page_image_bytes).decode('utf-8')
+    
+    system_prompt = f"""You are a Quality Assurance inspector for a drawing parser.
+A primary system (Roboflow) has scanned the attached image and found
+the annotations listed in the following JSON array:
+
+{found_annotations_json}
+
+**YOUR TASK:**
+Carefully scan the **entire image** and find any text-based annotations
+(dimensions, radii, view labels, GD&T) that are **MISSING** from the list.
+
+- Do NOT return items that are already in the list.
+- For each *new* item you find, parse it using the schemas below.
+- If you find no missing items, return an empty array [].
+
+**SCHEMAS:**
+{{
+  "id": "d_miss_1",
+  "type": "linear" | "radial" | "diameter" | "angular",
+  "value": 10.5,
+  "units": "mm",
+  "text": "R10"
+}}
+{{
+  "id": "t_miss_1",
+  "content": "Detail View A",
+  "layer": "TEXT",
+  "style": "Standard"
+}}
+
+**CRITICAL:** Return a JSON array of *only the missing items*."""
+    
+    # Define the response schema
+    response_schema = {
+        "type": "ARRAY",
+        "items": {
+            "type": "OBJECT",
+            "properties": {
+                "id": {"type": "STRING"},
+                "type": {"type": "STRING"},
+                "value": {"type": "NUMBER"},
+                "units": {"type": "STRING"},
+                "text": {"type": "STRING"},
+                "content": {"type": "STRING"},
+                "layer": {"type": "STRING"},
+                "style": {"type": "STRING"}
+            },
+            "required": ["id"]
+        }
+    }
+    
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": "Find all annotations missing from the provided list."},
+                    {
+                        "inlineData": {
+                            "mimeType": "image/png",
+                            "data": page_base64
+                        }
+                    }
+                ]
+            }
+        ],
+        "systemInstruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": response_schema
+        }
+    }
+    
+    # Implement retry logic
+    params = {"key": api_key}
+    headers = {"Content-Type": "application/json"}
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(url, json=payload, params=params, headers=headers, timeout=120)
+            
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < MAX_RETRIES - 1:
+                    wait = (attempt + 1) * 2
+                    logger.warning(f"API Error ({response.status_code}) on STAGE 3 call. Retrying in {wait}s (attempt {attempt+1}/{MAX_RETRIES})...")
+                    time.sleep(wait)
+                    continue
+                else:
+                    logger.error(f"API Error ({response.status_code}) exceeded retries on STAGE 3 call")
+                    response.raise_for_status()
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            if not result.get('candidates'):
+                logger.error(f"Stage 3 FAILED: No candidates in response. Response: {result}")
+                return []
+            
+            json_text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '[]')
+            missing_items = json.loads(json_text)
+            
+            if not isinstance(missing_items, list):
+                logger.error(f"Stage 3 FAILED: Expected array, got {type(missing_items)}")
+                return []
+            
+            logger.info(f"Stage 3: Found {len(missing_items)} missing annotations.")
+            return missing_items
+            
+        except requests.exceptions.HTTPError as e:
+            if (e.response.status_code == 429 or e.response.status_code >= 500) and attempt < MAX_RETRIES - 1:
+                continue
+            logger.error(f"API request failed with HTTP error: {e}", exc_info=True)
+            return []
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed with non-retriable error: {e}", exc_info=True)
+            return []
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing Stage 3 response: {e}", exc_info=True)
+            return []
+        except Exception as e:
+            logger.error(f"Error parsing Stage 3 response: {e}", exc_info=True)
+            return []
+    
+    logger.error("Rate limit exceeded after all retries on STAGE 3 call.")
+    return []
+

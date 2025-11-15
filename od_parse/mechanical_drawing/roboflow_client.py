@@ -10,6 +10,7 @@ Supports two modes:
 """
 
 import json
+import os
 import requests
 from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
@@ -23,7 +24,6 @@ logger = get_logger(__name__)
 ROBOFLOW_SERVER_URL = "http://localhost:9001"
 PROJECT_ID = "eng-drawing-ukrvj"
 MODEL_VERSION = 3
-DEFAULT_API_KEY = "ub3sg9EEXSEZhVGZL4JD"
 DEFAULT_CONFIDENCE = 0.05
 
 
@@ -47,7 +47,7 @@ def get_image_dimensions(image_path: Path) -> Tuple[int, int]:
 
 def call_roboflow_detection(
     image_path: Path,
-    api_key: str = DEFAULT_API_KEY,
+    api_key: Optional[str] = None,
     confidence: float = DEFAULT_CONFIDENCE,
     use_sdk: bool = False
 ) -> Dict[str, Any]:
@@ -60,7 +60,7 @@ def call_roboflow_detection(
     
     Args:
         image_path: Path to the image file
-        api_key: Roboflow API key (default: ub3sg9EEXSEZhVGZL4JD)
+        api_key: Roboflow API key (defaults to ROBOFLOW_API_KEY environment variable)
         confidence: Confidence threshold (default: 0.05 for 5%)
         use_sdk: If True, use Python SDK instead of local server
     
@@ -70,6 +70,10 @@ def call_roboflow_detection(
         - originalWidth: Image width in pixels
         - originalHeight: Image height in pixels
     """
+    # Get API key from parameter or environment variable
+    if api_key is None:
+        api_key = os.getenv("ROBOFLOW_API_KEY")
+    
     # Get image dimensions first
     try:
         original_width, original_height = get_image_dimensions(image_path)

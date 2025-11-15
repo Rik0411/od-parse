@@ -1,9 +1,10 @@
 """
 Mechanical Drawing Parser Module
 
-This module implements a hybrid two-stage pipeline for parsing engineering drawings:
+This module implements a hybrid three-stage pipeline for parsing engineering drawings:
 - Stage 1: Detection (Roboflow local server) - detects all potential annotations
 - Stage 2: Verification & Parsing (Gemini multimodal API) - verifies and parses all patches in a single batch API call
+- Stage 3: Missing Item Scan (Gemini multimodal API) - safety net that scans full image to find annotations Roboflow missed
 """
 
 from od_parse.mechanical_drawing.pipeline import (

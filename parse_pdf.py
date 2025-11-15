@@ -4,7 +4,9 @@ Intelligent file parser that automatically routes different file types to approp
 
 This script supports multiple file formats:
 - Raster images (.jpg, .jpeg, .png) → Raster Pipeline (hybrid Roboflow + Gemini)
-- PDF files (.pdf) → PDF Pipeline (converts to image, then Raster Pipeline)
+- PDF files (.pdf) → Intelligent PDF Triage:
+    - Vector PDFs (text-based): Fast text-only parsing via Gemini (skips pdf2image and Roboflow)
+    - Raster PDFs (scanned): Image-based pipeline (pdf2image + Roboflow + Gemini)
 - Vector files (.dxf, .dwg) → Vector Pipeline (simulation)
 
 The master controller (_route_file_by_type) automatically detects file type and delegates
@@ -20,8 +22,16 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
-from typing import List
+from typing import List, Tuple, Dict, Any
 from PIL import Image
+
+# Try to import PyMuPDF (fitz)
+try:
+    import fitz  # PyMuPDF
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    PYMUPDF_AVAILABLE = False
+    fitz = None
 
 # Fix Windows console encoding for Unicode characters
 if sys.platform == 'win32':
@@ -107,7 +117,7 @@ def main():
     # Process file using intelligent router
     try:
         print(f"Parsing file: {input_path.name}")
-        result = _route_file_by_type(input_path, api_keys, use_mechanical_drawing=args.mech)
+        result = _route_file_by_type(input_path, api_keys, use_mechanical_drawing=args.mech, args=args)
         
         # Write output to JSON file
         output_file = output_dir / f"{input_path.stem}.json"
@@ -232,6 +242,489 @@ def _parse_image_file(image_path: Path, api_keys: dict, use_mechanical_drawing: 
         print(f"Warning: Mechanical drawing pipeline failed: {e}")
         print("Falling back to LLM-based parsing...")
         return _parse_image_file_llm_fallback(image_path, api_keys, page_number)
+
+
+def runPdfPipeline(pdf_path: str, args) -> dict:
+    """
+    PIPELINE (TRIAGE): Opens the PDF and decides which pipeline to use.
+    
+    - Vector: If text is found AND --mech is True.
+    - Raster: If no text is found, OR if --mech is False.
+    
+    Args:
+        pdf_path: Path to the PDF file as string
+        args: argparse.Namespace object with .mech attribute
+        
+    Returns:
+        Dictionary containing parsed results
+    """
+    logger.info("Starting PDF Triage: Checking for vector text...")
+    doc = None
+    try:
+        if not PYMUPDF_AVAILABLE:
+            logger.warning("PyMuPDF not available. Falling back to raster pipeline.")
+            return runRasterPdfPipeline(pdf_path, args)
+        
+        pdf_path_obj = Path(pdf_path)
+        if not pdf_path_obj.exists():
+            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+        
+        doc = fitz.open(pdf_path)
+        has_vector_text = False
+        
+        # Check first 5 pages or all pages, whichever is smaller
+        pages_to_check = min(len(doc), 5)
+        for i in range(pages_to_check):
+            page = doc[i]
+            # page.get_text("text") is faster for a simple check
+            if page.get_text("text").strip():
+                has_vector_text = True
+                break
+        
+        # --- NEW TRIAGE LOGIC ---
+        
+        # PATH 1: Vector PDF + Mech Flag
+        # This is the "fast path": PyMuPDF text -> Gemini text parser
+        if has_vector_text and args.mech:
+            logger.info("Vector PDF detected. Routing to PyMuPDF + Gemini-Text pipeline.")
+            # We pass the *open document* to avoid re-opening
+            # doc is closed inside runVectorPdfPipeline
+            return runVectorPdfPipeline(doc, args)
+        
+        # PATH 2: Raster PDF OR Default Parser
+        # This is the "fallback path": pdf2image -> Image Parser
+        else:
+            doc.close()  # We don't need the doc anymore
+            doc = None
+            
+            if has_vector_text:
+                logger.info("Vector PDF detected, but --mech flag is off. Routing to default Raster pipeline (as it requires images).")
+            else:
+                logger.info("Raster PDF (scanned image) detected. Routing to Raster pipeline.")
+            
+            # Fall back to the "convert all to image" method
+            # This function handles both --mech (Roboflow) and default (single-stage)
+            return runRasterPdfPipeline(pdf_path, args)
+        # --- END NEW TRIAGE LOGIC ---
+        
+    except Exception as e:
+        if doc:
+            doc.close()
+        logger.error(f"Error during PDF triage: {e}", exc_info=True)
+        raise
+
+
+def runVectorPdfPipeline(doc, args) -> dict:
+    """
+    Process a vector PDF using the open PyMuPDF document.
+    
+    Extracts text from all pages and processes through Gemini text-only parser.
+    
+    Args:
+        doc: Open PyMuPDF document (will be closed after processing)
+        args: argparse.Namespace object
+        
+    Returns:
+        Dictionary containing parsed results
+    """
+    try:
+        # Extract text_data from all pages
+        text_data = []
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            page_text_dict = page.get_text("dict")
+            text_data.append(page_text_dict)
+        
+        # Get API keys from environment
+        api_keys = {
+            "google": os.getenv("GOOGLE_API_KEY")
+        }
+        
+        # Convert pdf_path from document name (doc.name is the file path)
+        pdf_path = Path(doc.name) if hasattr(doc, 'name') and doc.name else None
+        if not pdf_path:
+            raise ValueError("Cannot determine PDF path from document")
+        
+        # Call existing vector pipeline
+        return _run_vector_pdf_pipeline(pdf_path, api_keys, text_data)
+        
+    finally:
+        # Always close the document
+        if doc:
+            doc.close()
+
+
+def runRasterPdfPipeline(pdf_path: str, args) -> dict:
+    """
+    Process a raster PDF (or vector PDF when --mech is False) using image-based pipeline.
+    
+    Converts PDF to images and processes through appropriate pipeline based on --mech flag.
+    
+    Args:
+        pdf_path: Path to the PDF file as string
+        args: argparse.Namespace object with .mech attribute
+        
+    Returns:
+        Dictionary containing parsed results
+    """
+    # Get API keys from environment
+    api_keys = {
+        "google": os.getenv("GOOGLE_API_KEY")
+    }
+    
+    pdf_path_obj = Path(pdf_path)
+    
+    # If --mech flag is set, use mechanical drawing pipeline
+    if args.mech:
+        return _run_raster_pdf_pipeline(pdf_path_obj, api_keys)
+    else:
+        # Non-mechanical drawing mode: use existing LLM fallback logic
+        temp_image_paths = []
+        aggregated_result = None
+        
+        try:
+            # Convert ALL pages of PDF to PNG images
+            temp_image_paths = _convert_pdf_to_image(pdf_path_obj)
+            total_pages = len(temp_image_paths)
+            print(f"PDF converted to {total_pages} image(s)")
+            
+            # For LLM fallback, aggregate text, tables, forms, etc.
+            aggregated_result = {
+                'text': '',
+                'images': [],
+                'tables': [],
+                'forms': [],
+                'handwritten_content': [],
+                'metadata': {
+                    'source_file': str(pdf_path_obj),
+                    'source_type': 'pdf',
+                    'extraction_method': 'pdf_to_raster_pipeline',
+                    'total_pages': total_pages,
+                    'page_count': total_pages
+                },
+                'llm_analysis': {
+                    'extracted_data': {},
+                    'model_info': {
+                        'provider': 'google',
+                        'model': 'gemini-2.5-flash-preview-09-2025',
+                        'tokens_used': 0,
+                        'cost_estimate': 0
+                    },
+                    'processing_success': True
+                }
+            }
+            
+            # Process each page
+            for page_num, temp_image_path in enumerate(temp_image_paths, start=1):
+                try:
+                    print(f"Processing page {page_num}/{total_pages}...")
+                    page_result = _parse_image_file(
+                        temp_image_path, 
+                        api_keys, 
+                        use_mechanical_drawing=False,
+                        page_number=page_num
+                    )
+                    
+                    # LLM fallback: merge text, tables, forms
+                    if 'text' in page_result:
+                        if aggregated_result['text']:
+                            aggregated_result['text'] += '\n\n--- Page ' + str(page_num) + ' ---\n\n'
+                        aggregated_result['text'] += page_result.get('text', '')
+                    if 'tables' in page_result:
+                        aggregated_result['tables'].extend(page_result.get('tables', []))
+                    if 'forms' in page_result:
+                        aggregated_result['forms'].extend(page_result.get('forms', []))
+                    if 'handwritten_content' in page_result:
+                        aggregated_result['handwritten_content'].extend(page_result.get('handwritten_content', []))
+                    
+                except Exception as page_error:
+                    print(f"Warning: Failed to process page {page_num}: {page_error}", file=sys.stderr)
+                    # Continue processing other pages
+                    continue
+            
+            return aggregated_result
+            
+        finally:
+            # Clean up all temporary files
+            for temp_path in temp_image_paths:
+                if temp_path and temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except Exception as e:
+                        print(f"Warning: Failed to delete temporary file {temp_path}: {e}", file=sys.stderr)
+
+
+def _triage_pdf(pdf_path: Path) -> Tuple[bool, List[Dict[str, Any]]]:
+    """
+    Triage a PDF to determine if it contains extractable text (vector) or is scanned (raster).
+    
+    Uses PyMuPDF (fitz) to check if pages contain extractable text.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        
+    Returns:
+        Tuple of (has_text: bool, text_data: List[Dict]) where:
+        - has_text: True if any page has extractable text (vector PDF), False otherwise (raster PDF)
+        - text_data: List of page-level text dictionaries from PyMuPDF
+    """
+    if not PYMUPDF_AVAILABLE:
+        logger.warning("PyMuPDF not available. Falling back to raster pipeline.")
+        return (False, [])
+    
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+    
+    try:
+        doc = fitz.open(pdf_path)
+        text_data = []
+        has_text = False
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            page_text_dict = page.get_text("dict")
+            text_data.append(page_text_dict)
+            
+            # Check if page has any text blocks with actual content
+            blocks = page_text_dict.get("blocks", [])
+            for block in blocks:
+                if block.get("type") == 0:  # Text block
+                    lines = block.get("lines", [])
+                    for line in lines:
+                        spans = line.get("spans", [])
+                        for span in spans:
+                            text = span.get("text", "").strip()
+                            if text:  # Found non-empty text
+                                has_text = True
+                                break
+                        if has_text:
+                            break
+                    if has_text:
+                        break
+                if has_text:
+                    break
+        
+        doc.close()
+        
+        logger.info(f"PDF triage complete: {'Vector' if has_text else 'Raster'} PDF detected ({len(text_data)} pages)")
+        return (has_text, text_data)
+        
+    except Exception as e:
+        logger.error(f"Error triaging PDF: {e}", exc_info=True)
+        # Fallback to raster if triage fails
+        return (False, [])
+
+
+def _run_vector_pdf_pipeline(pdf_path: Path, api_keys: dict, text_data: List[Dict[str, Any]]) -> dict:
+    """
+    Process a vector PDF (text-based) using fast text-only parsing.
+    
+    This pipeline skips pdf2image and Roboflow, directly parsing extracted text.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        api_keys: Dictionary of API keys (must contain 'google' key for Gemini)
+        text_data: List of page-level text dictionaries from PyMuPDF
+        
+    Returns:
+        Dictionary containing parsed results in mechanical drawing format
+    """
+    from od_parse.mechanical_drawing.gemini_client import stage2_runBatchTextParsing
+    
+    # Get API key
+    gemini_api_key = api_keys.get("google") or os.getenv("GOOGLE_API_KEY")
+    if not gemini_api_key:
+        raise ValueError("Google API key is required. Set GOOGLE_API_KEY environment variable or pass it in api_keys dict.")
+    
+    # Initialize aggregated result structure
+    aggregated_result = {
+        'Measures': [],
+        'Radii': [],
+        'Views': [],
+        'GD_T': [],
+        'Materials': [],
+        'Notes': [],
+        'Threads': [],
+        'SurfaceRoughness': [],
+        'GeneralTolerances': [],
+        'TitleBlock': [],
+        'Other': [],
+        '_Errors': [],
+        '_FalsePositives': [],
+        'metadata': {
+            'source_file': str(pdf_path),
+            'source_type': 'pdf',
+            'extraction_method': 'vector_pdf_pipeline',
+            'total_pages': len(text_data),
+            'pipeline_type': 'vector'
+        }
+    }
+    
+    # Extract text items from each page and process
+    for page_num, page_text_dict in enumerate(text_data, start=1):
+        try:
+            logger.info(f"Processing vector PDF page {page_num}/{len(text_data)}...")
+            
+            # Extract text strings from the page text dict
+            text_items = []
+            blocks = page_text_dict.get("blocks", [])
+            for block in blocks:
+                if block.get("type") == 0:  # Text block
+                    lines = block.get("lines", [])
+                    for line in lines:
+                        spans = line.get("spans", [])
+                        for span in spans:
+                            text = span.get("text", "").strip()
+                            if text:  # Only add non-empty text
+                                text_items.append(text)
+            
+            if not text_items:
+                logger.warning(f"No text found on page {page_num}")
+                continue
+            
+            # Call text batch parser
+            parsed_items = stage2_runBatchTextParsing(
+                text_items=text_items,
+                page_number=page_num,
+                api_key=gemini_api_key
+            )
+            
+            # Categorize parsed items
+            for item in parsed_items:
+                if not item or not isinstance(item, dict):
+                    continue
+                
+                item_type = item.get("type", "").lower()
+                item_id = item.get("id", f"item_{page_num}_{len(aggregated_result['Other'])}")
+                
+                # Map parsed types to categories
+                if item_type in ["linear", "angular", "diameter"]:
+                    aggregated_result['Measures'].append({
+                        'id': item_id,
+                        'type': 'LinearDimension',
+                        'value': item.get("value"),
+                        'units': item.get("units", "mm"),
+                        'text': item.get("text", ""),
+                        'page_number': page_num
+                    })
+                elif item_type == "radial":
+                    aggregated_result['Radii'].append({
+                        'id': item_id,
+                        'type': 'Radius',
+                        'value': item.get("value"),
+                        'text': item.get("text", ""),
+                        'page_number': page_num
+                    })
+                elif "view" in item_type or item.get("content"):
+                    aggregated_result['Views'].append({
+                        'id': item_id,
+                        'type': 'ViewLabel',
+                        'name': item.get("content", item.get("text", "")),
+                        'text': item.get("text", ""),
+                        'page_number': page_num
+                    })
+                else:
+                    aggregated_result['Other'].append({
+                        **item,
+                        'page_number': page_num
+                    })
+                    
+        except Exception as page_error:
+            logger.error(f"Error processing vector PDF page {page_num}: {page_error}", exc_info=True)
+            aggregated_result['_Errors'].append({
+                'page': page_num,
+                'error': str(page_error)
+            })
+            continue
+    
+    return aggregated_result
+
+
+def _run_raster_pdf_pipeline(pdf_path: Path, api_keys: dict) -> dict:
+    """
+    Process a raster PDF (scanned/image-based) using existing image pipeline.
+    
+    This is the existing PDF processing logic that converts PDF to images
+    and processes through the hybrid Roboflow + Gemini pipeline.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        api_keys: Dictionary of API keys (must contain 'google' key for Gemini)
+        
+    Returns:
+        Dictionary containing parsed results in mechanical drawing format
+    """
+    temp_image_paths = []
+    aggregated_result = None
+    
+    try:
+        # Convert ALL pages of PDF to PNG images
+        temp_image_paths = _convert_pdf_to_image(pdf_path)
+        total_pages = len(temp_image_paths)
+        logger.info(f"PDF converted to {total_pages} image(s) for raster processing")
+        
+        # Initialize aggregated result structure
+        aggregated_result = {
+            'Measures': [],
+            'Radii': [],
+            'Views': [],
+            'GD_T': [],
+            'Materials': [],
+            'Notes': [],
+            'Threads': [],
+            'SurfaceRoughness': [],
+            'GeneralTolerances': [],
+            'TitleBlock': [],
+            'Other': [],
+            '_Errors': [],
+            '_FalsePositives': [],
+            'metadata': {
+                'source_file': str(pdf_path),
+                'source_type': 'pdf',
+                'extraction_method': 'raster_pdf_pipeline',
+                'total_pages': total_pages,
+                'pipeline_type': 'raster'
+            }
+        }
+        
+        # Process each page
+        for page_num, temp_image_path in enumerate(temp_image_paths, start=1):
+            try:
+                logger.info(f"Processing raster PDF page {page_num}/{total_pages}...")
+                page_result = _parse_image_file(
+                    temp_image_path, 
+                    api_keys, 
+                    use_mechanical_drawing=True,
+                    page_number=page_num
+                )
+                
+                # Aggregate results from mechanical pipeline
+                if 'llm_analysis' in page_result and 'extracted_data' in page_result['llm_analysis']:
+                    extracted = page_result['llm_analysis']['extracted_data']
+                    for category in ['Measures', 'Radii', 'Views', 'GD_T', 'Materials', 
+                                   'Notes', 'Threads', 'SurfaceRoughness', 'GeneralTolerances', 
+                                   'TitleBlock', 'Other', '_Errors', '_FalsePositives']:
+                        if category in extracted:
+                            aggregated_result[category].extend(extracted[category])
+                    
+            except Exception as page_error:
+                logger.error(f"Error processing raster PDF page {page_num}: {page_error}", exc_info=True)
+                aggregated_result['_Errors'].append({
+                    'page': page_num,
+                    'error': str(page_error)
+                })
+                continue
+        
+        return aggregated_result
+        
+    finally:
+        # Clean up all temporary files
+        for temp_path in temp_image_paths:
+            if temp_path and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception as e:
+                    logger.warning(f"Failed to delete temporary file {temp_path}: {e}")
 
 
 def _convert_pdf_to_image(pdf_path: Path) -> List[Path]:
@@ -477,20 +970,24 @@ def _parse_vector_file(vector_path: Path) -> dict:
     }
 
 
-def _route_file_by_type(file_path: Path, api_keys: dict, use_mechanical_drawing: bool = False) -> dict:
+def _route_file_by_type(file_path: Path, api_keys: dict, use_mechanical_drawing: bool = False, args=None) -> dict:
     """
     Master controller that routes files to the appropriate parsing pipeline.
     
     This intelligent router detects the file type by extension and delegates
     to the correct pipeline:
     - Raster files (.jpg, .png, .jpeg) → Raster Pipeline
-    - PDF files (.pdf) → PDF Pipeline (converts to image, then Raster Pipeline)
+    - PDF files (.pdf) → Intelligent PDF Triage via runPdfPipeline:
+        - Always checks for vector text
+        - Uses vector path only if text found AND --mech flag is True
+        - Otherwise uses raster path (pdf2image + appropriate pipeline)
     - Vector files (.dxf, .dwg) → Vector Pipeline (simulation)
     
     Args:
         file_path: Path to the file to parse
         api_keys: Dictionary of API keys (must contain 'google' key for Gemini)
-        use_mechanical_drawing: If True, use mechanical drawing pipeline for images
+        use_mechanical_drawing: If True, use mechanical drawing pipeline with intelligent PDF triage
+        args: Optional argparse.Namespace object (required for PDF processing)
         
     Returns:
         Dictionary containing parsed results
@@ -511,117 +1008,17 @@ def _route_file_by_type(file_path: Path, api_keys: dict, use_mechanical_drawing:
         return _parse_image_file(file_path, api_keys, use_mechanical_drawing=use_mechanical_drawing, page_number=1)
     
     elif file_ext == '.pdf':
-        # PDF Pipeline - convert ALL pages to images, then process each page
+        # PDF Pipeline - use new runPdfPipeline function for intelligent triage
         print(f"Routing to: PDF Pipeline")
-        temp_image_paths = []
-        aggregated_result = None
         
-        try:
-            # Convert ALL pages of PDF to PNG images
-            temp_image_paths = _convert_pdf_to_image(file_path)
-            total_pages = len(temp_image_paths)
-            print(f"PDF converted to {total_pages} image(s)")
-            
-            # Initialize aggregated result structure
-            if use_mechanical_drawing:
-                # For mechanical pipeline, aggregate by category
-                aggregated_result = {
-                    'Measures': [],
-                    'Radii': [],
-                    'Views': [],
-                    'GD_T': [],
-                    'Materials': [],
-                    'Notes': [],
-                    'Threads': [],
-                    'SurfaceRoughness': [],
-                    'GeneralTolerances': [],
-                    'TitleBlock': [],
-                    'Other': [],
-                    '_Errors': [],
-                    '_FalsePositives': [],
-                    'metadata': {
-                        'source_file': str(file_path),
-                        'source_type': 'pdf',
-                        'extraction_method': 'pdf_to_raster_pipeline',
-                        'total_pages': total_pages
-                    }
-                }
-            else:
-                # For LLM fallback, aggregate text, tables, forms, etc.
-                aggregated_result = {
-                    'text': '',
-                    'images': [],
-                    'tables': [],
-                    'forms': [],
-                    'handwritten_content': [],
-                    'metadata': {
-                        'source_file': str(file_path),
-                        'source_type': 'pdf',
-                        'extraction_method': 'pdf_to_raster_pipeline',
-                        'total_pages': total_pages,
-                        'page_count': total_pages
-                    },
-                    'llm_analysis': {
-                        'extracted_data': {},
-                        'model_info': {
-                            'provider': 'google',
-                            'model': 'gemini-2.5-flash-preview-09-2025',
-                            'tokens_used': 0,
-                            'cost_estimate': 0
-                        },
-                        'processing_success': True
-                    }
-                }
-            
-            # Process each page
-            for page_num, temp_image_path in enumerate(temp_image_paths, start=1):
-                try:
-                    print(f"Processing page {page_num}/{total_pages}...")
-                    page_result = _parse_image_file(
-                        temp_image_path, 
-                        api_keys, 
-                        use_mechanical_drawing=use_mechanical_drawing,
-                        page_number=page_num
-                    )
-                    
-                    # Aggregate results based on pipeline type
-                    if use_mechanical_drawing:
-                        # Mechanical pipeline: merge category arrays
-                        if 'llm_analysis' in page_result and 'extracted_data' in page_result['llm_analysis']:
-                            extracted = page_result['llm_analysis']['extracted_data']
-                            for category in ['Measures', 'Radii', 'Views', 'GD_T', 'Materials', 
-                                           'Notes', 'Threads', 'SurfaceRoughness', 'GeneralTolerances', 
-                                           'TitleBlock', 'Other', '_Errors', '_FalsePositives']:
-                                if category in extracted:
-                                    aggregated_result[category].extend(extracted[category])
-                    else:
-                        # LLM fallback: merge text, tables, forms
-                        if 'text' in page_result:
-                            if aggregated_result['text']:
-                                aggregated_result['text'] += '\n\n--- Page ' + str(page_num) + ' ---\n\n'
-                            aggregated_result['text'] += page_result.get('text', '')
-                        if 'tables' in page_result:
-                            aggregated_result['tables'].extend(page_result.get('tables', []))
-                        if 'forms' in page_result:
-                            aggregated_result['forms'].extend(page_result.get('forms', []))
-                        if 'handwritten_content' in page_result:
-                            aggregated_result['handwritten_content'].extend(page_result.get('handwritten_content', []))
-                    
-                except Exception as page_error:
-                    print(f"Warning: Failed to process page {page_num}: {page_error}", file=sys.stderr)
-                    # Continue processing other pages
-                    continue
-            
-            return aggregated_result
-            
-        finally:
-            # Clean up all temporary files
-            for temp_path in temp_image_paths:
-                if temp_path and temp_path.exists():
-                    try:
-                        temp_path.unlink()
-                    except Exception as e:
-                        print(f"Warning: Failed to delete temporary file {temp_path}: {e}", file=sys.stderr)
+        # Create args-like object if not provided (for backward compatibility)
+        if args is None:
+            class SimpleArgs:
+                def __init__(self, mech):
+                    self.mech = mech
+            args = SimpleArgs(use_mechanical_drawing)
+        
+        return runPdfPipeline(str(file_path), args)
     
     elif file_ext in ['.dxf', '.dwg']:
         # Vector Pipeline - simulation
