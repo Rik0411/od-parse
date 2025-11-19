@@ -1,0 +1,45 @@
+# Requirements for od-parse-fork: Intelligent Drawing Parser
+# 
+# This file contains all Python dependencies needed to run parse_pdf.py
+# on any machine. System dependencies (like Poppler) must be installed separately.
+#
+# Installation:
+#   pip install -r requirements.txt
+#
+# System Dependencies (must be installed separately):
+#   - Poppler: Required for pdf2image (PDF to image conversion)
+#     * macOS: brew install poppler
+#     * Linux: sudo apt-get install poppler-utils
+#     * Windows: Download from https://github.com/oschwartz10612/poppler-windows/releases
+#                and set POPPLER_PATH environment variable or add to PATH
+
+# Core PDF Processing Libraries
+pdfminer.six>=20221105
+PyMuPDF>=1.23.0  # Also known as 'fitz' - for vector PDF text extraction
+PyPDF2>=3.0.0  # For PDF writing and document chunking
+pdf2image>=1.16.3  # For converting PDF pages to images (requires Poppler)
+pdfplumber>=0.10.0  # Pure Python table extraction (no Java needed)
+
+# Image Processing Libraries
+Pillow>=9.5.0  # PIL - for image manipulation
+opencv-python>=4.7.0.72  # OpenCV - for image processing
+numpy>=1.24.3  # Numerical operations
+
+# OCR and Text Processing
+pytesseract>=0.3.10  # Python wrapper for Tesseract OCR
+
+# Utilities
+markdown>=3.4.3  # Markdown conversion
+psutil>=5.9.0  # For resource monitoring (required for agents)
+requests>=2.28.0  # For HTTP requests (API calls, vLLM server health checks)
+
+# Environment and Configuration
+python-dotenv>=1.0.0  # For loading .env files (used in parse_pdf.py)
+
+# Mechanical Drawing Pipeline (Optional but Recommended)
+# Roboflow SDK - used as fallback when local inference server is unavailable
+# Note: For best performance, use local Roboflow inference server instead:
+#   pip install inference-cli
+#   inference server start
+roboflow>=1.1.0  # Roboflow Python SDK for cloud API fallback
+
