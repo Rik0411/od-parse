@@ -196,7 +196,6 @@ def _parse_image_file(image_path: Path, api_keys: dict, use_mechanical_drawing: 
         )
         
         # Transform pipeline output to match expected format structure
-        # (maintaining compatibility with existing code that expects llm_analysis structure)
         enhanced_data = {
             'text': '',  # No text extraction in mechanical drawing pipeline
             'images': [],
@@ -210,16 +209,6 @@ def _parse_image_file(image_path: Path, api_keys: dict, use_mechanical_drawing: 
                 'page_number': page_number,
                 'extraction_method': 'mechanical_drawing_pipeline'
             },
-            'llm_analysis': {
-                'extracted_data': pipeline_result,
-                'model_info': {
-                    'provider': 'hybrid',
-                    'model': 'roboflow + gemini-2.0-flash',
-                    'tokens_used': 0,
-                    'cost_estimate': 0
-                },
-                'processing_success': True
-            },
             'document_classification': {
                 'document_type': 'mechanical_drawing',
                 'confidence': 1.0,
@@ -232,7 +221,8 @@ def _parse_image_file(image_path: Path, api_keys: dict, use_mechanical_drawing: 
                 'document_type': 'mechanical_drawing',
                 'processing_strategy': 'three_stage_hybrid_pipeline',
                 'vision_enabled': True
-            }
+            },
+            'extracted_data': pipeline_result
         }
         
         return enhanced_data
@@ -401,16 +391,6 @@ def runRasterPdfPipeline(pdf_path: str, args) -> dict:
                     'extraction_method': 'pdf_to_raster_pipeline',
                     'total_pages': total_pages,
                     'page_count': total_pages
-                },
-                'llm_analysis': {
-                    'extracted_data': {},
-                    'model_info': {
-                        'provider': 'google',
-                        'model': 'gemini-2.5-flash-preview-09-2025',
-                        'tokens_used': 0,
-                        'cost_estimate': 0
-                    },
-                    'processing_success': True
                 }
             }
             
@@ -699,8 +679,8 @@ def _run_raster_pdf_pipeline(pdf_path: Path, api_keys: dict) -> dict:
                 )
                 
                 # Aggregate results from mechanical pipeline
-                if 'llm_analysis' in page_result and 'extracted_data' in page_result['llm_analysis']:
-                    extracted = page_result['llm_analysis']['extracted_data']
+                if 'extracted_data' in page_result:
+                    extracted = page_result['extracted_data']
                     for category in ['Measures', 'Radii', 'Views', 'GD_T', 'Materials', 
                                    'Notes', 'Threads', 'SurfaceRoughness', 'GeneralTolerances', 
                                    'TitleBlock', 'Other', '_Errors', '_FalsePositives']:
@@ -1072,7 +1052,6 @@ def _parse_image_file_llm_fallback(image_path: Path, api_keys: dict, page_number
         )
         
         # Transform response to match expected format structure
-        # (maintaining compatibility with existing code that expects llm_analysis structure)
         enhanced_data = {
             'text': extracted_data.get('text', ''),
             'images': [],
@@ -1086,16 +1065,7 @@ def _parse_image_file_llm_fallback(image_path: Path, api_keys: dict, page_number
                 'page_number': page_number,
                 'extraction_method': 'image_batch_processing'
             },
-            'llm_analysis': {
-                'extracted_data': extracted_data,
-                'model_info': {
-                    'provider': 'google',
-                    'model': 'gemini-2.5-flash-preview-09-2025',
-                    'tokens_used': 0,
-                    'cost_estimate': 0
-                },
-                'processing_success': True
-            }
+            'extracted_data': extracted_data
         }
         
         return enhanced_data
@@ -1115,11 +1085,6 @@ def _parse_image_file_llm_fallback(image_path: Path, api_keys: dict, page_number
                 'page_number': page_number,
                 'extraction_method': 'image_batch_processing',
                 'error': str(e)
-            },
-            'llm_analysis': {
-                'extracted_data': {},
-                'error': str(e),
-                'processing_success': False
             }
         }
 
