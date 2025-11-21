@@ -73,10 +73,12 @@ except ImportError:
 
 # Import from main module to get LLM-enhanced parser
 from od_parse.main import parse_pdf
+# Import Excel pipeline
+from od_parse.excel import runExcelPipeline
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Intelligent file parser supporting PDF, images (PNG, JPG, JPEG), and vector files (DXF, DWG) using odparse with Gemini VLM'
+        description='Intelligent file parser supporting PDF, images (PNG, JPG, JPEG), vector files (DXF, DWG), and Excel files (.xlsx, .xls) using odparse with Gemini VLM'
     )
     parser.add_argument('input_file', help='Path to the file to parse (PDF, image, or vector file)')
     parser.add_argument('--output-dir', '-o', default='output', help='Output directory for JSON file (default: output)')
@@ -93,7 +95,7 @@ def main():
     
     # Check file extension
     file_ext = input_path.suffix.lower()
-    supported_extensions = ['.pdf', '.png', '.jpg', '.jpeg', '.dxf', '.dwg']
+    supported_extensions = ['.pdf', '.png', '.jpg', '.jpeg', '.dxf', '.dwg', '.xlsx', '.xls']
     if file_ext not in supported_extensions:
         print(f"Error: Unsupported file type: {file_ext}", file=sys.stderr)
         print(f"Supported formats: {', '.join(supported_extensions)}", file=sys.stderr)
@@ -108,11 +110,15 @@ def main():
         "google": os.getenv("GOOGLE_API_KEY")
     }
     
-    # Google API key is only required for raster/PDF pipelines, not vector
+    # Google API key is only required for raster/PDF/Excel pipelines, not vector
     if file_ext not in ['.dxf', '.dwg'] and not api_keys["google"]:
-        print("Error: GOOGLE_API_KEY not found in environment variables", file=sys.stderr)
-        print("Please set GOOGLE_API_KEY in your .env file or environment", file=sys.stderr)
-        return 1
+        # Excel files only need API key if --mech flag is set
+        if file_ext in ['.xlsx', '.xls'] and not args.mech:
+            pass  # Excel without --mech doesn't need API key
+        else:
+            print("Error: GOOGLE_API_KEY not found in environment variables", file=sys.stderr)
+            print("Please set GOOGLE_API_KEY in your .env file or environment", file=sys.stderr)
+            return 1
     
     # Process file using intelligent router
     try:
@@ -1005,8 +1011,13 @@ def _route_file_by_type(file_path: Path, api_keys: dict, use_mechanical_drawing:
         print(f"Routing to: Vector Pipeline (Simulation)")
         return _parse_vector_file(file_path)
     
+    elif file_ext in ['.xlsx', '.xls']:
+        # Excel Pipeline
+        logger.info("Routing to: Excel Pipeline")
+        return runExcelPipeline(str(file_path), args)
+    
     else:
-        raise ValueError(f"Unsupported file type: {file_ext}. Supported formats: .jpg, .jpeg, .png, .pdf, .dxf, .dwg")
+        raise ValueError(f"Unsupported file type: {file_ext}. Supported formats: .jpg, .jpeg, .png, .pdf, .dxf, .dwg, .xlsx, .xls")
 
 
 def _parse_image_file_llm_fallback(image_path: Path, api_keys: dict, page_number: int = 1) -> dict:
