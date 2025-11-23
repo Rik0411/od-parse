@@ -75,6 +75,8 @@ except ImportError:
 from od_parse.main import parse_pdf
 # Import Excel pipeline
 from od_parse.excel import runExcelPipeline
+# Import robust image extraction
+from od_parse.image_extraction import extract_images_from_pdf
 
 def main():
     parser = argparse.ArgumentParser(
@@ -123,7 +125,7 @@ def main():
     # Process file using intelligent router
     try:
         print(f"Parsing file: {input_path.name}")
-        result = _route_file_by_type(input_path, api_keys, use_mechanical_drawing=args.mech, args=args)
+        result = _route_file_by_type(input_path, api_keys, use_mechanical_drawing=args.mech, args=args, output_dir=output_dir)
         
         # Write output to JSON file
         output_file = output_dir / f"{input_path.stem}.json"
@@ -240,7 +242,7 @@ def _parse_image_file(image_path: Path, api_keys: dict, use_mechanical_drawing: 
         return _parse_image_file_llm_fallback(image_path, api_keys, page_number)
 
 
-def runPdfPipeline(pdf_path: str, args) -> dict:
+def runPdfPipeline(pdf_path: str, args, output_dir: Path = None) -> dict:
     """
     PIPELINE (TRIAGE): Opens the PDF and decides which pipeline to use.
     
@@ -250,6 +252,7 @@ def runPdfPipeline(pdf_path: str, args) -> dict:
     Args:
         pdf_path: Path to the PDF file as string
         args: argparse.Namespace object with .mech attribute
+        output_dir: Optional output directory for saving extracted images
         
     Returns:
         Dictionary containing parsed results
@@ -259,7 +262,7 @@ def runPdfPipeline(pdf_path: str, args) -> dict:
     try:
         if not PYMUPDF_AVAILABLE:
             logger.warning("PyMuPDF not available. Falling back to raster pipeline.")
-            return runRasterPdfPipeline(pdf_path, args)
+            return runRasterPdfPipeline(pdf_path, args, output_dir)
         
         pdf_path_obj = Path(pdf_path)
         if not pdf_path_obj.exists():
@@ -285,7 +288,7 @@ def runPdfPipeline(pdf_path: str, args) -> dict:
             logger.info("Vector PDF detected. Routing to PyMuPDF + Gemini-Text pipeline.")
             # We pass the *open document* to avoid re-opening
             # doc is closed inside runVectorPdfPipeline
-            return runVectorPdfPipeline(doc, args)
+            return runVectorPdfPipeline(doc, args, output_dir)
         
         # PATH 2: Raster PDF OR Default Parser
         # This is the "fallback path": pdf2image -> Image Parser
@@ -300,7 +303,7 @@ def runPdfPipeline(pdf_path: str, args) -> dict:
             
             # Fall back to the "convert all to image" method
             # This function handles both --mech (Roboflow) and default (single-stage)
-            return runRasterPdfPipeline(pdf_path, args)
+            return runRasterPdfPipeline(pdf_path, args, output_dir)
         # --- END NEW TRIAGE LOGIC ---
         
     except Exception as e:
@@ -310,7 +313,7 @@ def runPdfPipeline(pdf_path: str, args) -> dict:
         raise
 
 
-def runVectorPdfPipeline(doc, args) -> dict:
+def runVectorPdfPipeline(doc, args, output_dir: Path = None) -> dict:
     """
     Process a vector PDF using the open PyMuPDF document.
     
@@ -319,6 +322,7 @@ def runVectorPdfPipeline(doc, args) -> dict:
     Args:
         doc: Open PyMuPDF document (will be closed after processing)
         args: argparse.Namespace object
+        output_dir: Optional output directory for saving extracted images
         
     Returns:
         Dictionary containing parsed results
@@ -341,8 +345,40 @@ def runVectorPdfPipeline(doc, args) -> dict:
         if not pdf_path:
             raise ValueError("Cannot determine PDF path from document")
         
+        # Extract embedded images before closing document
+        image_paths = []
+        if output_dir:
+            try:
+                embedded_images = extract_images_from_pdf(doc)
+                
+                # Save images to output directory
+                for img in embedded_images:
+                    img_filename = f"page_{img.page_num}_embedded_{len(image_paths)}.{img.format}"
+                    img_path = output_dir / img_filename
+                    
+                    # Ensure output directory exists
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Save image bytes to file
+                    with open(img_path, 'wb') as f:
+                        f.write(img.image_bytes)
+                    
+                    image_paths.append(str(img_path))
+                    logger.info(f"Extracted embedded image from page {img.page_num}: {img_path}")
+            except Exception as e:
+                logger.warning(f"Failed to extract embedded images: {e}")
+        
         # Call existing vector pipeline
-        return _run_vector_pdf_pipeline(pdf_path, api_keys, text_data)
+        result = _run_vector_pdf_pipeline(pdf_path, api_keys, text_data)
+        
+        # Add images to result if we have a standard structure
+        # Note: Vector pipeline returns mechanical drawing format, so we add images to metadata or top level
+        if image_paths:
+            if 'images' not in result:
+                result['images'] = []
+            result['images'].extend(image_paths)
+        
+        return result
         
     finally:
         # Always close the document
@@ -350,7 +386,7 @@ def runVectorPdfPipeline(doc, args) -> dict:
             doc.close()
 
 
-def runRasterPdfPipeline(pdf_path: str, args) -> dict:
+def runRasterPdfPipeline(pdf_path: str, args, output_dir: Path = None) -> dict:
     """
     Process a raster PDF (or vector PDF when --mech is False) using image-based pipeline.
     
@@ -359,6 +395,7 @@ def runRasterPdfPipeline(pdf_path: str, args) -> dict:
     Args:
         pdf_path: Path to the PDF file as string
         args: argparse.Namespace object with .mech attribute
+        output_dir: Optional output directory for saving extracted images
         
     Returns:
         Dictionary containing parsed results
@@ -372,7 +409,39 @@ def runRasterPdfPipeline(pdf_path: str, args) -> dict:
     
     # If --mech flag is set, use mechanical drawing pipeline
     if args.mech:
-        return _run_raster_pdf_pipeline(pdf_path_obj, api_keys)
+        result = _run_raster_pdf_pipeline(pdf_path_obj, api_keys)
+        
+        # Extract embedded images and add to result
+        if output_dir:
+            try:
+                doc = fitz.open(pdf_path_obj)
+                embedded_images = extract_images_from_pdf(doc)
+                doc.close()
+                
+                # Save images to output directory
+                image_paths = []
+                for img in embedded_images:
+                    img_filename = f"page_{img.page_num}_embedded_{len(image_paths)}.{img.format}"
+                    img_path = output_dir / img_filename
+                    
+                    # Ensure output directory exists
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Save image bytes to file
+                    with open(img_path, 'wb') as f:
+                        f.write(img.image_bytes)
+                    
+                    image_paths.append(str(img_path))
+                    logger.info(f"Extracted embedded image from page {img.page_num}: {img_path}")
+                
+                # Add images to result
+                if 'images' not in result:
+                    result['images'] = []
+                result['images'].extend(image_paths)
+            except Exception as e:
+                logger.warning(f"Failed to extract embedded images: {e}")
+        
+        return result
     else:
         # Non-mechanical drawing mode: use existing LLM fallback logic
         temp_image_paths = []
@@ -399,6 +468,31 @@ def runRasterPdfPipeline(pdf_path: str, args) -> dict:
                     'page_count': total_pages
                 }
             }
+            
+            # Extract embedded images from PDF
+            if output_dir:
+                try:
+                    doc = fitz.open(pdf_path_obj)
+                    embedded_images = extract_images_from_pdf(doc)
+                    doc.close()
+                    
+                    # Save embedded images to output directory
+                    for img in embedded_images:
+                        # Create filename: page_{page_num}_embedded_{index}.{format}
+                        img_filename = f"page_{img.page_num}_embedded_{len(aggregated_result['images'])}.{img.format}"
+                        img_path = output_dir / img_filename
+                        
+                        # Ensure output directory exists
+                        output_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        # Save image bytes to file
+                        with open(img_path, 'wb') as f:
+                            f.write(img.image_bytes)
+                        
+                        aggregated_result['images'].append(str(img_path))
+                        logger.info(f"Extracted embedded image from page {img.page_num}: {img_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to extract embedded images: {e}")
             
             # Process each page
             for page_num, temp_image_path in enumerate(temp_image_paths, start=1):
@@ -956,7 +1050,7 @@ def _parse_vector_file(vector_path: Path) -> dict:
     }
 
 
-def _route_file_by_type(file_path: Path, api_keys: dict, use_mechanical_drawing: bool = False, args=None) -> dict:
+def _route_file_by_type(file_path: Path, api_keys: dict, use_mechanical_drawing: bool = False, args=None, output_dir: Path = None) -> dict:
     """
     Master controller that routes files to the appropriate parsing pipeline.
     
@@ -974,6 +1068,7 @@ def _route_file_by_type(file_path: Path, api_keys: dict, use_mechanical_drawing:
         api_keys: Dictionary of API keys (must contain 'google' key for Gemini)
         use_mechanical_drawing: If True, use mechanical drawing pipeline with intelligent PDF triage
         args: Optional argparse.Namespace object (required for PDF processing)
+        output_dir: Optional output directory for saving extracted images
         
     Returns:
         Dictionary containing parsed results
@@ -1004,7 +1099,7 @@ def _route_file_by_type(file_path: Path, api_keys: dict, use_mechanical_drawing:
                     self.mech = mech
             args = SimpleArgs(use_mechanical_drawing)
         
-        return runPdfPipeline(str(file_path), args)
+        return runPdfPipeline(str(file_path), args, output_dir)
     
     elif file_ext in ['.dxf', '.dwg']:
         # Vector Pipeline - simulation
