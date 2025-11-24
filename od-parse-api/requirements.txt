@@ -1,0 +1,37 @@
+# FastAPI and Web Server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6  # For file uploads
+pydantic-settings>=2.0.0  # For settings management
+
+# Core PDF Processing Libraries
+pdfminer.six>=20221105
+PyMuPDF>=1.23.0  # Also known as 'fitz' - for vector PDF text extraction
+PyPDF2>=3.0.0  # For PDF writing and document chunking
+pdf2image>=1.16.3  # For converting PDF pages to images (requires Poppler)
+pdfplumber>=0.10.0  # Pure Python table extraction (no Java needed)
+
+# Image Processing Libraries
+Pillow>=9.5.0  # PIL - for image manipulation
+opencv-python>=4.7.0.72  # OpenCV - for image processing
+numpy>=1.24.3  # Numerical operations
+
+# OCR and Text Processing
+pytesseract>=0.3.10  # Python wrapper for Tesseract OCR
+
+# Utilities
+markdown>=3.4.3  # Markdown conversion
+psutil>=5.9.0  # For resource monitoring (required for agents)
+requests>=2.28.0  # For HTTP requests (API calls, vLLM server health checks)
+
+# Excel Pipeline
+duckdb>=0.9.0  # In-memory SQL engine for Excel data processing
+pandas>=2.0.0  # Data manipulation and Excel file reading
+openpyxl>=3.1.0  # Excel .xlsx file support
+
+# Environment and Configuration
+python-dotenv>=1.0.0  # For loading .env files
+
+# Mechanical Drawing Pipeline (Optional but Recommended)
+roboflow>=1.1.0  # Roboflow Python SDK for cloud API fallback
+
