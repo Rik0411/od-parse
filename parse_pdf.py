@@ -75,6 +75,8 @@ except ImportError:
 from od_parse.main import parse_pdf
 # Import Excel pipeline
 from od_parse.excel import runExcelPipeline
+# Import Office document pipelines
+from od_parse.office import runDocxPipeline, runPptxPipeline
 # Import robust image extraction
 from od_parse.image_extraction import extract_images_from_pdf
 
@@ -97,7 +99,7 @@ def main():
     
     # Check file extension
     file_ext = input_path.suffix.lower()
-    supported_extensions = ['.pdf', '.png', '.jpg', '.jpeg', '.dxf', '.dwg', '.xlsx', '.xls']
+    supported_extensions = ['.pdf', '.png', '.jpg', '.jpeg', '.dxf', '.dwg', '.xlsx', '.xls', '.docx', '.pptx']
     if file_ext not in supported_extensions:
         print(f"Error: Unsupported file type: {file_ext}", file=sys.stderr)
         print(f"Supported formats: {', '.join(supported_extensions)}", file=sys.stderr)
@@ -160,6 +162,36 @@ def main():
         return 1
 
 
+def _split_text_into_paragraphs(text: str) -> List[str]:
+    """
+    Split text into an array of paragraphs.
+    
+    Args:
+        text: Input text string (may contain newlines)
+        
+    Returns:
+        List of paragraph strings, with empty paragraphs filtered out
+    """
+    if not text or not text.strip():
+        return []
+    
+    # First try splitting by double newlines (paragraph breaks)
+    if '\n\n' in text:
+        paragraphs = text.split('\n\n')
+    else:
+        # Fallback: split by single newlines if no double newlines found
+        paragraphs = text.split('\n')
+    
+    # Filter and clean paragraphs
+    result = []
+    for para in paragraphs:
+        cleaned = para.strip()
+        if cleaned:  # Only add non-empty paragraphs
+            result.append(cleaned)
+    
+    return result
+
+
 def _parse_image_file(image_path: Path, api_keys: dict, use_mechanical_drawing: bool = False, page_number: int = 1) -> dict:
     """
     Parse an image file using either the mechanical drawing pipeline or LLM-based parsing.
@@ -205,7 +237,7 @@ def _parse_image_file(image_path: Path, api_keys: dict, use_mechanical_drawing: 
         
         # Transform pipeline output to match expected format structure
         enhanced_data = {
-            'text': '',  # No text extraction in mechanical drawing pipeline
+            'text_content': [],  # No text extraction in mechanical drawing pipeline
             'images': [],
             'tables': [],
             'forms': [],
@@ -455,7 +487,7 @@ def runRasterPdfPipeline(pdf_path: str, args, output_dir: Path = None) -> dict:
             
             # For LLM fallback, aggregate text, tables, forms, etc.
             aggregated_result = {
-                'text': '',
+                'text_content': [],
                 'images': [],
                 'tables': [],
                 'forms': [],
@@ -506,10 +538,18 @@ def runRasterPdfPipeline(pdf_path: str, args, output_dir: Path = None) -> dict:
                     )
                     
                     # LLM fallback: merge text, tables, forms
-                    if 'text' in page_result:
-                        if aggregated_result['text']:
-                            aggregated_result['text'] += '\n\n--- Page ' + str(page_num) + ' ---\n\n'
-                        aggregated_result['text'] += page_result.get('text', '')
+                    # Handle both 'text' (old format) and 'text_content' (new format) for backward compatibility
+                    page_text = page_result.get('text_content', [])
+                    if not page_text and 'text' in page_result:
+                        # Convert old format to new format
+                        page_text = _split_text_into_paragraphs(page_result.get('text', ''))
+                    
+                    if page_text:
+                        # Add page marker as a separate paragraph if we already have content
+                        if aggregated_result['text_content']:
+                            aggregated_result['text_content'].append(f'--- Page {page_num} ---')
+                        # Append all paragraphs from this page
+                        aggregated_result['text_content'].extend(page_text)
                     if 'tables' in page_result:
                         aggregated_result['tables'].extend(page_result.get('tables', []))
                     if 'forms' in page_result:
@@ -1084,9 +1124,34 @@ def _route_file_by_type(file_path: Path, api_keys: dict, use_mechanical_drawing:
     
     # Route to appropriate pipeline
     if file_ext in ['.jpg', '.jpeg', '.png']:
-        # Raster Pipeline - use existing image parser (single image, page 1)
+        # Raster Pipeline - apply image enhancement if needed, then use existing image parser
         print(f"Routing to: Raster Pipeline")
-        return _parse_image_file(file_path, api_keys, use_mechanical_drawing=use_mechanical_drawing, page_number=1)
+        
+        # Apply image enhancement for low-resolution images
+        try:
+            from od_parse.preprocessing.image_enhancement import enhance_low_res_image
+            
+            enhanced_image_path = enhance_low_res_image(str(file_path))
+            # Use enhanced image if it's different from original (enhancement was applied)
+            image_path_to_use = Path(enhanced_image_path) if enhanced_image_path != str(file_path) else file_path
+            
+            result = _parse_image_file(image_path_to_use, api_keys, use_mechanical_drawing=use_mechanical_drawing, page_number=1)
+            
+            # Clean up temporary enhanced image if one was created
+            if enhanced_image_path != str(file_path):
+                try:
+                    from od_parse.preprocessing.image_enhancement import cleanup_enhanced_image
+                    cleanup_enhanced_image(enhanced_image_path)
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup enhanced image: {e}")
+            
+            return result
+        except ImportError:
+            logger.warning("Image enhancement module not available, processing original image")
+            return _parse_image_file(file_path, api_keys, use_mechanical_drawing=use_mechanical_drawing, page_number=1)
+        except Exception as e:
+            logger.warning(f"Image enhancement failed: {e}, processing original image")
+            return _parse_image_file(file_path, api_keys, use_mechanical_drawing=use_mechanical_drawing, page_number=1)
     
     elif file_ext == '.pdf':
         # PDF Pipeline - use new runPdfPipeline function for intelligent triage
@@ -1111,8 +1176,30 @@ def _route_file_by_type(file_path: Path, api_keys: dict, use_mechanical_drawing:
         logger.info("Routing to: Excel Pipeline")
         return runExcelPipeline(str(file_path), args)
     
+    elif file_ext == '.docx':
+        # Word Document Pipeline
+        logger.info("Routing to: Word Document Pipeline")
+        # Create args-like object if not provided (for backward compatibility)
+        if args is None:
+            class SimpleArgs:
+                def __init__(self, mech):
+                    self.mech = mech
+            args = SimpleArgs(use_mechanical_drawing)
+        return runDocxPipeline(str(file_path), args, output_dir)
+    
+    elif file_ext == '.pptx':
+        # PowerPoint Presentation Pipeline
+        logger.info("Routing to: PowerPoint Presentation Pipeline")
+        # Create args-like object if not provided (for backward compatibility)
+        if args is None:
+            class SimpleArgs:
+                def __init__(self, mech):
+                    self.mech = mech
+            args = SimpleArgs(use_mechanical_drawing)
+        return runPptxPipeline(str(file_path), args, output_dir)
+    
     else:
-        raise ValueError(f"Unsupported file type: {file_ext}. Supported formats: .jpg, .jpeg, .png, .pdf, .dxf, .dwg, .xlsx, .xls")
+        raise ValueError(f"Unsupported file type: {file_ext}. Supported formats: .jpg, .jpeg, .png, .pdf, .dxf, .dwg, .xlsx, .xls, .docx, .pptx")
 
 
 def _parse_image_file_llm_fallback(image_path: Path, api_keys: dict, page_number: int = 1) -> dict:
@@ -1158,8 +1245,12 @@ def _parse_image_file_llm_fallback(image_path: Path, api_keys: dict, page_number
         )
         
         # Transform response to match expected format structure
+        # Convert text to text_content array format
+        extracted_text = extracted_data.get('text', '')
+        text_content = _split_text_into_paragraphs(extracted_text) if extracted_text else []
+        
         enhanced_data = {
-            'text': extracted_data.get('text', ''),
+            'text_content': text_content,
             'images': [],
             'tables': extracted_data.get('tables', []),
             'forms': extracted_data.get('forms', []),
@@ -1179,7 +1270,7 @@ def _parse_image_file_llm_fallback(image_path: Path, api_keys: dict, page_number
     except Exception as e:
         # If batch processing fails, return error structure
         return {
-            'text': '',
+            'text_content': [],
             'images': [],
             'tables': [],
             'forms': [],

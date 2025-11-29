@@ -6,7 +6,7 @@ for intelligent Bill of Materials (BOM) mapping.
 """
 
 from od_parse.excel.pipeline import runExcelPipeline
-from od_parse.excel.gemini_client import generate_duckdb_sql_for_bom
+from od_parse.excel.gemini_client import generate_duckdb_sql_for_bom, generate_excel_image_description
 
-__all__ = ['runExcelPipeline', 'generate_duckdb_sql_for_bom']
+__all__ = ['runExcelPipeline', 'generate_duckdb_sql_for_bom', 'generate_excel_image_description']
 
