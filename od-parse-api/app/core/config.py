@@ -22,7 +22,16 @@ class Settings(BaseSettings):
     max_file_size_mb: int = 100
     temp_dir: Path = Path("/tmp/od-parse")
     allowed_extensions: List[str] = [
-        '.pdf', '.png', '.jpg', '.jpeg', '.xlsx', '.xls', '.dxf', '.dwg'
+        '.pdf',
+        '.png',
+        '.jpg',
+        '.jpeg',
+        '.xlsx',
+        '.xls',
+        '.dxf',
+        '.dwg',
+        '.docx',
+        '.pptx',
     ]
     
     # Application Info

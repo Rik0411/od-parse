@@ -122,9 +122,17 @@ async def route_and_parse(
         )
     
     else:
-        raise ValueError(
-            f"Unsupported file type: {file_ext}. "
-            f"Supported formats: .jpg, .jpeg, .png, .pdf, .dxf, .dwg, .xlsx, .xls"
+        # Delegate to the master router in parse_pdf.py for additional types
+        # such as .docx and .pptx, and to keep supported-format logic in sync.
+        logger.info(f"Routing to: Master router in parse_pdf.py for {file_path.name}")
+        from parse_pdf import _route_file_by_type as master_route  # local import to avoid cycles
+        return await asyncio.to_thread(
+            master_route,
+            file_path,
+            api_keys,
+            mech_mode,
+            args,
+            output_dir,
         )
 
 
