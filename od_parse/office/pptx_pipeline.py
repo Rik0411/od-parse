@@ -66,10 +66,10 @@ def runPptxPipeline(file_path: str, args, output_dir: Optional[Path] = None) -> 
     
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Get API key from environment if --mech flag is set
-    api_key = os.getenv("GOOGLE_API_KEY") if args.mech else None
-    if args.mech and not api_key:
-        logger.warning("--mech flag is set but GOOGLE_API_KEY not found. Images will not be captioned.")
+    # Get API key from environment (always try to get it for image descriptions)
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        logger.debug("GOOGLE_API_KEY not found. Images will not be captioned.")
     
     result = {
         "file_type": "pptx",
@@ -138,11 +138,12 @@ def runPptxPipeline(file_path: str, args, output_dir: Optional[Path] = None) -> 
                     image_info = {
                         "path": str(image_path),
                         "format": ext,
+                        "size_bytes": len(image_bytes),
                         "description": "Image extracted from slide"
                     }
                     
-                    # Semantic Analysis (ONLY if --mech is on)
-                    if args.mech and generate_excel_image_description and api_key:
+                    # Semantic Analysis (if API key is available)
+                    if generate_excel_image_description and api_key:
                         try:
                             # Convert bytes to PIL Image (required by generate_excel_image_description)
                             pil_image = Image.open(io.BytesIO(image_bytes))
@@ -163,4 +164,11 @@ def runPptxPipeline(file_path: str, args, output_dir: Optional[Path] = None) -> 
         result["slides"].append(slide_data)
 
     logger.info(f"PPTX extraction complete. Parsed {len(result['slides'])} slides.")
-    return result
+    # Remove empty fields before returning (keep file_type always)
+    # For slides, we need to check each slide's fields too
+    cleaned_slides = []
+    for slide in result['slides']:
+        cleaned_slide = {k: v for k, v in slide.items() if v or k == 'slide_number'}
+        cleaned_slides.append(cleaned_slide)
+    result['slides'] = cleaned_slides
+    return {k: v for k, v in result.items() if v or k == 'file_type'}

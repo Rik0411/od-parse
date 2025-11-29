@@ -82,10 +82,10 @@ def runDocxPipeline(file_path: str, args, output_dir: Optional[Path] = None) -> 
     
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Get API key from environment if --mech flag is set
-    api_key = os.getenv("GOOGLE_API_KEY") if args.mech else None
-    if args.mech and not api_key:
-        logger.warning("--mech flag is set but GOOGLE_API_KEY not found. Images will not be captioned.")
+    # Get API key from environment (always try to get it for image descriptions)
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        logger.debug("GOOGLE_API_KEY not found. Images will not be captioned.")
     
     result = {
         "file_type": "docx",
@@ -155,8 +155,8 @@ def runDocxPipeline(file_path: str, args, output_dir: Optional[Path] = None) -> 
                     "description": "Image extracted from document"
                 }
                 
-                # Semantic Analysis (ONLY if --mech is on)
-                if args.mech and generate_excel_image_description and api_key:
+                # Semantic Analysis (if API key is available)
+                if generate_excel_image_description and api_key:
                     try:
                         # Convert bytes to PIL Image (required by generate_excel_image_description)
                         pil_image = Image.open(io.BytesIO(image_bytes))
@@ -176,4 +176,5 @@ def runDocxPipeline(file_path: str, args, output_dir: Optional[Path] = None) -> 
                 logger.warning(f"Failed to extract an image: {e}")
 
     logger.info(f"DOCX extraction complete. Found {len(result['tables'])} tables and {len(result['images'])} images.")
-    return result
+    # Remove empty fields before returning (keep file_type always)
+    return {k: v for k, v in result.items() if v or k == 'file_type'}

@@ -14,6 +14,7 @@ to the correct pipeline, making this an intelligent, multi-format parser.
 """
 
 import argparse
+import io
 import json
 import math
 import os
@@ -79,6 +80,11 @@ from od_parse.excel import runExcelPipeline
 from od_parse.office import runDocxPipeline, runPptxPipeline
 # Import robust image extraction
 from od_parse.image_extraction import extract_images_from_pdf
+# Import image description function
+try:
+    from od_parse.excel.gemini_client import generate_excel_image_description
+except ImportError:
+    generate_excel_image_description = None
 
 def main():
     parser = argparse.ArgumentParser(
@@ -175,12 +181,59 @@ def _split_text_into_paragraphs(text: str) -> List[str]:
     if not text or not text.strip():
         return []
     
+    import re
+    
     # First try splitting by double newlines (paragraph breaks)
     if '\n\n' in text:
         paragraphs = text.split('\n\n')
-    else:
+    elif '\n' in text:
         # Fallback: split by single newlines if no double newlines found
         paragraphs = text.split('\n')
+    else:
+        # If no newlines, split on sentence boundaries
+        # Split on periods, exclamation marks, or question marks followed by space
+        # This will create sentence boundaries
+        sentences = re.split(r'([.!?])\s+', text)
+        
+        # Reconstruct sentences with their punctuation
+        reconstructed_sentences = []
+        for i in range(0, len(sentences) - 1, 2):
+            if i + 1 < len(sentences):
+                sentence = sentences[i].strip() + sentences[i + 1]
+                if sentence:
+                    reconstructed_sentences.append(sentence)
+        # Add last part if it exists and wasn't paired
+        if len(sentences) % 2 == 1 and sentences[-1].strip():
+            reconstructed_sentences.append(sentences[-1].strip())
+        
+        # Group sentences into paragraphs (every 2-4 sentences, or ~200-400 chars)
+        paragraphs = []
+        current_para = ""
+        sentence_count = 0
+        
+        for sentence in reconstructed_sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            
+            if current_para:
+                current_para += " " + sentence
+            else:
+                current_para = sentence
+            
+            sentence_count += 1
+            
+            # Start new paragraph if:
+            # 1. We have 3-4 sentences, OR
+            # 2. Current paragraph is getting long (>400 chars)
+            if sentence_count >= 3 or len(current_para) > 400:
+                paragraphs.append(current_para)
+                current_para = ""
+                sentence_count = 0
+        
+        # Add remaining text as last paragraph
+        if current_para:
+            paragraphs.append(current_para)
     
     # Filter and clean paragraphs
     result = []
@@ -378,14 +431,15 @@ def runVectorPdfPipeline(doc, args, output_dir: Path = None) -> dict:
             raise ValueError("Cannot determine PDF path from document")
         
         # Extract embedded images before closing document
-        image_paths = []
+        image_objects = []
         if output_dir:
             try:
                 embedded_images = extract_images_from_pdf(doc)
+                api_key = api_keys.get("google") or os.getenv("GOOGLE_API_KEY")
                 
                 # Save images to output directory
                 for img in embedded_images:
-                    img_filename = f"page_{img.page_num}_embedded_{len(image_paths)}.{img.format}"
+                    img_filename = f"page_{img.page_num}_embedded_{len(image_objects)}.{img.format}"
                     img_path = output_dir / img_filename
                     
                     # Ensure output directory exists
@@ -395,7 +449,26 @@ def runVectorPdfPipeline(doc, args, output_dir: Path = None) -> dict:
                     with open(img_path, 'wb') as f:
                         f.write(img.image_bytes)
                     
-                    image_paths.append(str(img_path))
+                    # Create image object with standardized format
+                    image_info = {
+                        "path": str(img_path),
+                        "format": img.format,
+                        "size_bytes": len(img.image_bytes),
+                        "description": "Image extracted from PDF"
+                    }
+                    
+                    # Generate description if API key is available
+                    if generate_excel_image_description and api_key:
+                        try:
+                            pil_image = Image.open(io.BytesIO(img.image_bytes))
+                            if pil_image.mode != 'RGB':
+                                pil_image = pil_image.convert('RGB')
+                            desc = generate_excel_image_description(pil_image, api_key)
+                            image_info["description"] = desc
+                        except Exception as e:
+                            logger.warning(f"Failed to generate description for image from page {img.page_num}: {e}")
+                    
+                    image_objects.append(image_info)
                     logger.info(f"Extracted embedded image from page {img.page_num}: {img_path}")
             except Exception as e:
                 logger.warning(f"Failed to extract embedded images: {e}")
@@ -403,12 +476,19 @@ def runVectorPdfPipeline(doc, args, output_dir: Path = None) -> dict:
         # Call existing vector pipeline
         result = _run_vector_pdf_pipeline(pdf_path, api_keys, text_data)
         
+        # Add file_type to result
+        result['file_type'] = 'pdf'
+        
         # Add images to result if we have a standard structure
         # Note: Vector pipeline returns mechanical drawing format, so we add images to metadata or top level
-        if image_paths:
+        if image_objects:
             if 'images' not in result:
                 result['images'] = []
-            result['images'].extend(image_paths)
+            result['images'].extend(image_objects)
+        
+        # Remove empty images array if it exists and is empty
+        if 'images' in result and not result['images']:
+            del result['images']
         
         return result
         
@@ -450,10 +530,12 @@ def runRasterPdfPipeline(pdf_path: str, args, output_dir: Path = None) -> dict:
                 embedded_images = extract_images_from_pdf(doc)
                 doc.close()
                 
+                api_key = api_keys.get("google") or os.getenv("GOOGLE_API_KEY")
+                
                 # Save images to output directory
-                image_paths = []
+                image_objects = []
                 for img in embedded_images:
-                    img_filename = f"page_{img.page_num}_embedded_{len(image_paths)}.{img.format}"
+                    img_filename = f"page_{img.page_num}_embedded_{len(image_objects)}.{img.format}"
                     img_path = output_dir / img_filename
                     
                     # Ensure output directory exists
@@ -463,15 +545,41 @@ def runRasterPdfPipeline(pdf_path: str, args, output_dir: Path = None) -> dict:
                     with open(img_path, 'wb') as f:
                         f.write(img.image_bytes)
                     
-                    image_paths.append(str(img_path))
+                    # Create image object with standardized format
+                    image_info = {
+                        "path": str(img_path),
+                        "format": img.format,
+                        "size_bytes": len(img.image_bytes),
+                        "description": "Image extracted from PDF"
+                    }
+                    
+                    # Generate description if API key is available
+                    if generate_excel_image_description and api_key:
+                        try:
+                            pil_image = Image.open(io.BytesIO(img.image_bytes))
+                            if pil_image.mode != 'RGB':
+                                pil_image = pil_image.convert('RGB')
+                            desc = generate_excel_image_description(pil_image, api_key)
+                            image_info["description"] = desc
+                        except Exception as e:
+                            logger.warning(f"Failed to generate description for image from page {img.page_num}: {e}")
+                    
+                    image_objects.append(image_info)
                     logger.info(f"Extracted embedded image from page {img.page_num}: {img_path}")
                 
                 # Add images to result
                 if 'images' not in result:
                     result['images'] = []
-                result['images'].extend(image_paths)
+                result['images'].extend(image_objects)
             except Exception as e:
                 logger.warning(f"Failed to extract embedded images: {e}")
+        
+        # Add file_type to result
+        result['file_type'] = 'pdf'
+        
+        # Remove empty images array if it exists and is empty
+        if 'images' in result and not result['images']:
+            del result['images']
         
         return result
     else:
@@ -485,20 +593,15 @@ def runRasterPdfPipeline(pdf_path: str, args, output_dir: Path = None) -> dict:
             total_pages = len(temp_image_paths)
             print(f"PDF converted to {total_pages} image(s)")
             
-            # For LLM fallback, aggregate text, tables, forms, etc.
+            # Get API key for image descriptions
+            api_key = api_keys.get("google") or os.getenv("GOOGLE_API_KEY")
+            
+            # For LLM fallback, aggregate text, tables, etc.
             aggregated_result = {
+                'file_type': 'pdf',
                 'text_content': [],
                 'images': [],
-                'tables': [],
-                'forms': [],
-                'handwritten_content': [],
-                'metadata': {
-                    'source_file': str(pdf_path_obj),
-                    'source_type': 'pdf',
-                    'extraction_method': 'pdf_to_raster_pipeline',
-                    'total_pages': total_pages,
-                    'page_count': total_pages
-                }
+                'tables': []
             }
             
             # Extract embedded images from PDF
@@ -521,7 +624,26 @@ def runRasterPdfPipeline(pdf_path: str, args, output_dir: Path = None) -> dict:
                         with open(img_path, 'wb') as f:
                             f.write(img.image_bytes)
                         
-                        aggregated_result['images'].append(str(img_path))
+                        # Create image object with standardized format
+                        image_info = {
+                            "path": str(img_path),
+                            "format": img.format,
+                            "size_bytes": len(img.image_bytes),
+                            "description": "Image extracted from PDF"
+                        }
+                        
+                        # Generate description if API key is available
+                        if generate_excel_image_description and api_key:
+                            try:
+                                pil_image = Image.open(io.BytesIO(img.image_bytes))
+                                if pil_image.mode != 'RGB':
+                                    pil_image = pil_image.convert('RGB')
+                                desc = generate_excel_image_description(pil_image, api_key)
+                                image_info["description"] = desc
+                            except Exception as e:
+                                logger.warning(f"Failed to generate description for image from page {img.page_num}: {e}")
+                        
+                        aggregated_result['images'].append(image_info)
                         logger.info(f"Extracted embedded image from page {img.page_num}: {img_path}")
                 except Exception as e:
                     logger.warning(f"Failed to extract embedded images: {e}")
@@ -552,17 +674,14 @@ def runRasterPdfPipeline(pdf_path: str, args, output_dir: Path = None) -> dict:
                         aggregated_result['text_content'].extend(page_text)
                     if 'tables' in page_result:
                         aggregated_result['tables'].extend(page_result.get('tables', []))
-                    if 'forms' in page_result:
-                        aggregated_result['forms'].extend(page_result.get('forms', []))
-                    if 'handwritten_content' in page_result:
-                        aggregated_result['handwritten_content'].extend(page_result.get('handwritten_content', []))
                     
                 except Exception as page_error:
                     print(f"Warning: Failed to process page {page_num}: {page_error}", file=sys.stderr)
                     # Continue processing other pages
                     continue
             
-            return aggregated_result
+            # Remove empty fields before returning
+            return {k: v for k, v in aggregated_result.items() if v or k == 'file_type'}
             
         finally:
             # Clean up all temporary files
@@ -658,6 +777,7 @@ def _run_vector_pdf_pipeline(pdf_path: Path, api_keys: dict, text_data: List[Dic
     
     # Initialize aggregated result structure
     aggregated_result = {
+        'file_type': 'pdf',
         'Measures': [],
         'Radii': [],
         'Views': [],
@@ -785,6 +905,7 @@ def _run_raster_pdf_pipeline(pdf_path: Path, api_keys: dict) -> dict:
         
         # Initialize aggregated result structure
         aggregated_result = {
+            'file_type': 'pdf',
             'Measures': [],
             'Radii': [],
             'Views': [],
