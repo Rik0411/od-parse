@@ -40,6 +40,13 @@ dependencies = [
     "markdown>=3.4.3",
     "psutil>=5.9.0",  # For resource monitoring (required for agents)
     "requests>=2.28.0",  # For vLLM server health checks
+    "duckdb>=0.9.0",  # Excel pipeline
+    "pandas>=2.0.0",  # Excel pipeline
+    "openpyxl>=3.1.0",  # Excel .xlsx support
+    "python-docx>=1.1.0",  # Word document support
+    "python-pptx>=0.6.23",  # PowerPoint support
+    "roboflow>=1.1.0",  # Mechanical drawing pipeline
+    "python-dotenv>=1.0.0",  # Environment variable loading
 ]
 
 [project.urls]
@@ -176,3 +183,10 @@ target-version = ["py38"]
 [tool.isort]
 profile = "black"
 line_length = 88
+
+[tool.setuptools]
+py-modules = ["parse_pdf"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["od_parse*"]

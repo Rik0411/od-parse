@@ -16,6 +16,7 @@ to the correct pipeline, making this an intelligent, multi-format parser.
 import argparse
 import io
 import json
+import logging
 import math
 import os
 import sys
@@ -23,7 +24,7 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Union, Optional
 from PIL import Image
 
 # Try to import PyMuPDF (fitz)
@@ -43,7 +44,6 @@ if sys.platform == 'win32':
         sys.stderr.reconfigure(encoding='utf-8', errors='replace')
     
     # Configure logging to use UTF-8 encoding
-    import logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -1209,6 +1209,66 @@ def _parse_vector_file(vector_path: Path) -> dict:
             'processing_note': 'This is a simulated output. In production, a real DXF/DWG parser would be used.'
         }
     }
+
+
+def parse_file(
+    file_path: Union[str, Path],
+    api_keys: Optional[dict] = None,
+    mech_mode: bool = False,
+    output_dir: Optional[Union[str, Path]] = None
+) -> dict:
+    """
+    Public API for parsing files. Main entry point for external APIs.
+    
+    Args:
+        file_path: Path to the file to parse (PDF, image, Excel, DOCX, PPTX, etc.)
+        api_keys: Dictionary of API keys (must contain 'google' key for Gemini)
+                  If None, will read from environment variables
+        mech_mode: If True, use mechanical drawing pipeline for images/PDFs
+        output_dir: Optional output directory for saving extracted images
+        
+    Returns:
+        Dictionary containing parsed results with standardized structure:
+        {
+            'file_type': str,
+            'text_content': List[str],  # Array of paragraphs
+            'tables': List[dict],       # Optional
+            'images': List[dict]        # Optional, with paths
+        }
+        
+    Raises:
+        ValueError: If file type is unsupported
+        FileNotFoundError: If file doesn't exist
+    """
+    # Convert to Path if string
+    file_path = Path(file_path)
+    
+    # Get API keys from parameter or environment
+    if api_keys is None:
+        api_keys = {
+            "google": os.getenv("GOOGLE_API_KEY"),
+            "roboflow": os.getenv("ROBOFLOW_API_KEY")
+        }
+    
+    # Convert output_dir to Path if provided
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+    
+    # Create args-like object for backward compatibility
+    class SimpleArgs:
+        def __init__(self, mech):
+            self.mech = mech
+    
+    args = SimpleArgs(mech_mode)
+    
+    # Call the internal routing function
+    return _route_file_by_type(
+        file_path=file_path,
+        api_keys=api_keys,
+        use_mechanical_drawing=mech_mode,
+        args=args,
+        output_dir=output_dir
+    )
 
 
 def _route_file_by_type(file_path: Path, api_keys: dict, use_mechanical_drawing: bool = False, args=None, output_dir: Path = None) -> dict:

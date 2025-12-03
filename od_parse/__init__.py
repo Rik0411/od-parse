@@ -17,6 +17,14 @@ from od_parse.converter import convert_to_markdown
 from od_parse.main import parse_forms_separately, parse_segmented
 from od_parse.config.llm_config import get_llm_config
 
+# Main parsing entry point for external APIs
+try:
+    from parse_pdf import parse_file
+    PARSE_FILE_AVAILABLE = True
+except ImportError:
+    PARSE_FILE_AVAILABLE = False
+    parse_file = None
+
 # Agentic AI features (v0.2.0+)
 try:
     from od_parse.parser.optimized_parser import (
@@ -118,6 +126,10 @@ __all__ = [
     'convert_to_markdown',
     'parse_forms_separately',
     'parse_segmented',
+
+    # Main parsing entry point for external APIs
+    'parse_file',
+    'PARSE_FILE_AVAILABLE',
 
     # Model selection helpers
     'get_available_models',
